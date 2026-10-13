@@ -20,7 +20,7 @@ STATIC = ROOT / "static"
 OPENWRT_ARCHIVE = ROOT / "assets" / "openwrt-armsr-armv8-rootfs.tar.gz"
 OPENWRT_BUNDLE_PATH = "assets/openwrt-armsr-armv8-rootfs.tar.gz"
 GUI_IMAGE = "kasmweb/ubuntu-focal-desktop:1.16.0"
-KINDS = {"client", "router", "server"}
+KINDS = {"client", "router", "server", "switch"}
 ID_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,39}$")
 MAC_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 
@@ -31,6 +31,48 @@ class TopologyError(ValueError):
 
 def yaml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def topology_segments(nodes: list[dict], links: list[dict]) -> list[dict]:
+    """Map logical switches (including switch-to-switch trunks) to L2 bridges.
+
+    Physical containers never get an interface for a switch: the container's
+    endpoint attaches straight to the Docker bridge for that switch component.
+    Legacy physical-to-physical links remain independent bridge networks.
+    """
+    kinds = {node["id"]: node["type"] for node in nodes}
+    parent = {node["id"]: node["id"] for node in nodes if node["type"] == "switch"}
+
+    def root(node_id: str) -> str:
+        while parent[node_id] != node_id:
+            parent[node_id] = parent[parent[node_id]]
+            node_id = parent[node_id]
+        return node_id
+
+    for link in links:
+        source, target = link["source"], link["target"]
+        if kinds[source] == kinds[target] == "switch":
+            a, b = root(source), root(target)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+
+    segments = {}
+    for link in links:
+        source, target = link["source"], link["target"]
+        switches = [x for x in (source, target) if kinds[x] == "switch"]
+        key = "sw_" + root(switches[0]) if switches else "link_" + link["id"]
+        segment = segments.setdefault(key, {"key": key, "links": [], "subnet": link["subnet"], "members": {}})
+        if segment["subnet"] != link["subnet"]:
+            raise TopologyError(f"同一交换机网络的网段不一致：{segment['subnet']} 与 {link['subnet']}")
+        segment["links"].append(link)
+        for side in ("source", "target"):
+            member = link[side]
+            if kinds[member] == "switch":
+                continue
+            if member in segment["members"]:
+                raise TopologyError(f"节点 {member} 重复连接同一个交换机网段，请只保留一个端口")
+            segment["members"][member] = {"ip": link[side + "Ip"], "mac": link[side + "Mac"]}
+    return list(segments.values())
 
 
 def normalize(data: object) -> tuple[list[dict], list[dict]]:
@@ -55,18 +97,14 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
         if kind not in KINDS or not isinstance(name, str) or not name.strip() or len(name) > 60:
             raise TopologyError(f"节点 {node_id} 的类型或名称无效")
         gui = raw.get("gui", False)
-        if not isinstance(gui, bool) or (kind == "router" and gui):
+        if not isinstance(gui, bool) or (kind in ("router", "switch") and gui):
             raise TopologyError(f"节点 {node_id} 的 GUI 配置无效")
         node = {"id": node_id, "type": kind, "name": name.strip(), "gui": gui}
         node_by_id[node_id] = node
         clean_nodes.append(node)
 
     clean_links = []
-    link_ids = set()
-    seen_pairs = set()
-    used_ips = set()
-    used_macs = set()
-    networks: list[ipaddress.IPv4Network] = []
+    link_ids, seen_pairs, used_ips, used_macs = set(), set(), set(), set()
     degree = {node_id: 0 for node_id in node_by_id}
     for raw in links:
         if not isinstance(raw, dict):
@@ -76,7 +114,7 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
             raise TopologyError("连线 ID 无效或重复")
         if source not in node_by_id or target not in node_by_id or source == target:
             raise TopologyError(f"连线 {link_id} 的端点无效")
-        pair = frozenset((source, target))
+        pair = tuple(sorted((source, target)))
         if pair in seen_pairs:
             raise TopologyError(f"{source} 与 {target} 已有连线")
         seen_pairs.add(pair)
@@ -87,11 +125,13 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
             raise TopologyError(f"连线 {link_id} 的网段无效，请输入例如 10.200.1.0/24") from None
         if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen > 29:
             raise TopologyError(f"连线 {link_id} 需要 /29 或更大的 IPv4 网段，为 Docker 网关预留地址")
-        if any(network.overlaps(other) for other in networks):
-            raise TopologyError(f"连线 {link_id} 的网段与其他连线重叠")
-        networks.append(network)
         clean = {"id": link_id, "source": source, "target": target, "subnet": str(network)}
         for side in ("source", "target"):
+            if node_by_id[raw[side]]["type"] == "switch":
+                # Backwards-compatible payload: ignore address fields on the switch side.
+                clean[side + "Ip"] = ""
+                clean[side + "Mac"] = ""
+                continue
             try:
                 address = ipaddress.ip_address(raw.get(side + "Ip", ""))
             except (ValueError, TypeError):
@@ -99,7 +139,7 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
             if (not isinstance(address, ipaddress.IPv4Address) or address not in network
                     or address == network.network_address or address == network.broadcast_address
                     or int(address) == int(network.network_address) + 1):
-                raise TopologyError(f"连线 {link_id} 的 {side} IP 不在可用网段内")
+                raise TopologyError(f"连线 {link_id} 的 {side} IP 不在可用网段内（首个主机地址留给 Docker 网关）")
             if address in used_ips:
                 raise TopologyError(f"IP 地址重复：{address}")
             used_ips.add(address)
@@ -107,8 +147,7 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
             if not isinstance(mac, str) or not MAC_PATTERN.fullmatch(mac):
                 raise TopologyError(f"连线 {link_id} 的 {side} MAC 无效")
             mac = mac.lower()
-            first_octet = int(mac[:2], 16)
-            if first_octet & 1:
+            if int(mac[:2], 16) & 1:
                 raise TopologyError(f"MAC 地址不能是组播地址：{mac}")
             if mac in used_macs:
                 raise TopologyError(f"MAC 地址重复：{mac}")
@@ -122,50 +161,63 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
     for node in clean_nodes:
         if degree[node["id"]] == 0:
             raise TopologyError(f"节点「{node['name']}」尚未连接，请先添加连线")
-        if node["type"] != "router" and degree[node["id"]] > 1:
-            raise TopologyError(f"客户端或服务器「{node['name']}」只能连接一条线；请用路由器分支")
+        if node["type"] in ("client", "server") and degree[node["id"]] > 1:
+            raise TopologyError(f"客户端或服务器「{node['name']}」只能连接一条线；请连接到交换机扩展网段")
+
+    segments = topology_segments(clean_nodes, clean_links)
+    used_networks = []
+    for segment in segments:
+        network = ipaddress.ip_network(segment["subnet"])
+        if any(network.overlaps(other) for other in used_networks):
+            raise TopologyError(f"不同二层网段不能重叠：{segment['subnet']}")
+        used_networks.append(network)
+        if not segment["members"]:
+            raise TopologyError(f"交换机网段 {segment['subnet']} 没有连接任何主机或路由器")
     return clean_nodes, clean_links
 
 
 def route_commands(nodes: list[dict], links: list[dict]) -> tuple[dict[str, list[str]], list[str]]:
-    """Find the first router hop to each remote link subnet."""
+    """Use router-only transit over shared L2 segments for static routes."""
     kinds = {node["id"]: node["type"] for node in nodes}
-    attachments: dict[str, list[tuple[dict, str, str]]] = {node["id"]: [] for node in nodes}
-    for link in links:
-        attachments[link["source"]].append((link, "source", link["target"]))
-        attachments[link["target"]].append((link, "target", link["source"]))
+    segments = topology_segments(nodes, links)
+    members_to_segments = {node["id"]: [] for node in nodes if node["type"] != "switch"}
+    for segment in segments:
+        for member in segment["members"]:
+            members_to_segments[member].append(segment)
 
     commands: dict[str, list[str]] = {}
     warnings = []
     for node in nodes:
         source = node["id"]
-        direct = {link["id"] for link, _, _ in attachments[source]}
-        # Search only router transit nodes. The stored first hop is the router IP
-        # on a link directly attached to the source container.
+        if node["type"] == "switch":
+            continue
+        direct = {seg["key"] for seg in members_to_segments[source]}
         queue = deque()
         seen = {source}
-        for link, side, neighbor in attachments[source]:
-            if kinds[neighbor] == "router" and neighbor not in seen:
-                seen.add(neighbor)
-                queue.append((neighbor, link["targetIp" if side == "source" else "sourceIp"]))
+        for seg in members_to_segments[source]:
+            for neighbor, interface in seg["members"].items():
+                if kinds[neighbor] == "router" and neighbor not in seen:
+                    seen.add(neighbor)
+                    queue.append((neighbor, interface["ip"]))
         reachable: dict[str, str] = {}
         while queue:
             router, first_hop = queue.popleft()
-            for link, side, neighbor in attachments[router]:
-                if link["id"] not in direct:
-                    reachable.setdefault(link["id"], first_hop)
-                if kinds[neighbor] == "router" and neighbor not in seen:
-                    seen.add(neighbor)
-                    queue.append((neighbor, first_hop))
+            for seg in members_to_segments[router]:
+                if seg["key"] not in direct:
+                    reachable.setdefault(seg["key"], first_hop)
+                for neighbor in seg["members"]:
+                    if kinds[neighbor] == "router" and neighbor not in seen:
+                        seen.add(neighbor)
+                        queue.append((neighbor, first_hop))
         commands[source] = []
-        for link in links:
-            if link["id"] in direct:
+        for seg in segments:
+            if seg["key"] in direct:
                 continue
-            hop = reachable.get(link["id"])
+            hop = reachable.get(seg["key"])
             if hop:
-                commands[source].append(f"ip route replace {link['subnet']} via {hop}")
+                commands[source].append(f"ip route replace {seg['subnet']} via {hop}")
             else:
-                warnings.append(f"「{node['name']}」无法通过路由器到达 {link['subnet']}")
+                warnings.append(f"「{node['name']}」无法通过路由器到达 {seg['subnet']}")
     return commands, warnings
 
 
@@ -187,19 +239,23 @@ def dockerfile(kind: str, gui: bool = False) -> str:
 
 def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     nodes, links = normalize(data)
-    if any(node["type"] == "router" for node in nodes) and not OPENWRT_ARCHIVE.is_file():
-        raise TopologyError("缺少 OpenWrt rootfs，请将归档放入 assets 目录")
+    has_router = any(node["type"] == "router" for node in nodes)
+    if has_router and not OPENWRT_ARCHIVE.is_file():
+        raise TopologyError("缺少 OpenWrt rootfs，请将归档放入 assets/openwrt-armsr-armv8-rootfs.tar.gz")
+    segments = topology_segments(nodes, links)
     commands, warnings = route_commands(nodes, links)
-    attachments = {node["id"]: [] for node in nodes}
-    for link in links:
-        attachments[link["source"]].append((link, "source"))
-        attachments[link["target"]].append((link, "target"))
+    attachments = {node["id"]: [] for node in nodes if node["type"] != "switch"}
+    for segment in segments:
+        for member, interface in segment["members"].items():
+            attachments[member].append((segment["key"], interface))
     lines = ["name: topology-lab", "services:"]
     files = {}
     gui_ports = {}
     next_gui_port = 6901
     for node in nodes:
         node_id, kind, gui = node["id"], node["type"], node["gui"]
+        if kind == "switch":
+            continue  # One bridge per L2 domain; no pretend switch container.
         files[f"dockerfiles/{node_id}.Dockerfile"] = dockerfile(kind, gui)
         lines.extend([
             f"  {node_id}:",
@@ -227,7 +283,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             lines.extend(["    cap_add:", "      - NET_ADMIN"])
         if kind == "router":
             lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"1\""])
-        startup = commands[node_id]
+        startup = list(commands[node_id])
         if gui:
             hook = startup + (["(nohup python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/topology-http.log 2>&1 </dev/null &)"] if kind == "server" else [])
             if hook:
@@ -240,41 +296,49 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             startup += ["python3 -m http.server 8000 --bind 0.0.0.0"] if kind == "server" else ["tail -f /dev/null"]
             lines.append(f"    command: [\"sh\", \"-c\", {yaml_string(' && '.join(startup))}]")
         lines.append("    networks:")
-        for link, side in attachments[node_id]:
+        for key, interface in attachments[node_id]:
             lines.extend([
-                f"      net_{link['id']}:",
-                f"        ipv4_address: {link[side + 'Ip']}",
-                f"        mac_address: {link[side + 'Mac']}",
+                f"      net_{key}:",
+                f"        ipv4_address: {interface['ip']}",
+                f"        mac_address: {interface['mac']}",
             ])
     lines.append("networks:")
-    for link in links:
+    for segment in segments:
         lines.extend([
-            f"  net_{link['id']}:",
+            f"  net_{segment['key']}:",
             "    driver: bridge",
             "    ipam:",
             "      config:",
-            f"        - subnet: {link['subnet']}",
+            f"        - subnet: {segment['subnet']}",
         ])
     files["compose.yaml"] = "\n".join(lines) + "\n"
     if gui_ports:
         files[".env"] = "VNC_PW=" + secrets.token_urlsafe(16) + "\n"
-    lines = ["# Generated topology", "", "Run `docker compose up --build -d` in this directory.", "Use `docker compose ps` to inspect containers and `docker compose down` to stop them.", "", "## Nodes", ""]
+    readme = ["# Generated topology", "", "Run `docker compose up --build -d` in this directory.", "Use `docker compose ps` to inspect containers and `docker compose down` to stop them.", "", "## Nodes", ""]
     for node in nodes:
         suffix = "，GUI" if node["gui"] else ""
-        lines.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix})")
-    lines.extend(["", "## Links", ""])
+        detail = "（Docker bridge 虚拟二层交换机，不创建容器）" if node["type"] == "switch" else ""
+        readme.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix}){detail}")
+    readme.extend(["", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
+    for segment in segments:
+        participants = ", ".join(f"{node_id}={iface['ip']}" for node_id, iface in segment["members"].items())
+        readme.append(f"- `net_{segment['key']}` `{segment['subnet']}`: {participants}")
+    readme.extend(["", "## Links", ""])
+    kinds = {node["id"]: node["type"] for node in nodes}
     for link in links:
-        lines.append(f"- `{link['source']}` ↔ `{link['target']}`: `{link['subnet']}`; {link['sourceIp']} / {link['targetIp']}")
+        source_ip = link['sourceIp'] if kinds[link['source']] != 'switch' else 'switch port'
+        target_ip = link['targetIp'] if kinds[link['target']] != 'switch' else 'switch port'
+        readme.append(f"- `{link['source']}` ↔ `{link['target']}`: `{link['subnet']}`; {source_ip} / {target_ip}")
     if gui_ports:
-        lines.extend(["", "## GUI access", "", "Open the following local HTTPS URLs after starting Compose. The desktop password is `VNC_PW` in `.env`.", ""])
-        lines.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
-        lines.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The GUI server also starts an HTTP service on container port 8000."])
-    if any(node["type"] == "router" for node in nodes):
-        lines.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
+        readme.extend(["", "## GUI access", "", "Open the following local HTTPS URLs after starting Compose. The desktop password is `VNC_PW` in `.env`.", ""])
+        readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
+        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The GUI server also starts an HTTP service on container port 8000."])
+    if has_router:
+        readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     if warnings:
-        lines.extend(["", "## Connectivity notes", ""])
-        lines.extend(f"- {warning}" for warning in warnings)
-    files["README.md"] = "\n".join(lines) + "\n"
+        readme.extend(["", "## Connectivity notes", ""])
+        readme.extend(f"- {warning}" for warning in warnings)
+    files["README.md"] = "\n".join(readme) + "\n"
     files["topology.json"] = json.dumps({"nodes": nodes, "links": links}, ensure_ascii=False, indent=2) + "\n"
     return files, warnings
 

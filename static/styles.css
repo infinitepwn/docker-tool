@@ -15,3 +15,14 @@
 .gui-option span{display:block;min-width:0}
 .gui-option strong{display:block;font-size:11px;color:#40596a}
 .gui-option small{display:block;font-size:9px;color:#91a2af;margin-top:4px;line-height:1.3;word-break:break-all}
+
+/* Switch component and interface address chips */
+.palette-icon.switch{background:#594b29;color:#ffdb78}
+.topology-node.switch .node-icon{background:#fff2d4;color:#ac7d23}
+.legend-dot.switch{background:#d8a53e}
+.topology-node{min-height:92px;align-items:flex-start}
+.node-copy{flex:1}
+.node-ips{display:flex!important;flex-direction:column;gap:2px;margin-top:7px!important}
+.node-ips small{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:#237981;overflow-wrap:anywhere;max-width:95px}
+.node-port{top:38px}
+.canvas-footer{flex-wrap:wrap;padding-top:10px;padding-bottom:10px}

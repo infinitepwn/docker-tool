@@ -4,9 +4,9 @@ const world = $('#world');
 const nodeLayer = $('#nodes');
 const edgeLayer = $('#edges');
 const STORAGE_KEY = 'topology-lab-v1';
-const TYPE_LABEL = { client: '客户端', router: '路由器', server: '服务器' };
-const TYPE_ICON = { client: '⌘', router: '◇', server: '▣' };
-const NODE_W = 154, NODE_H = 77;
+const TYPE_LABEL = { client: '客户端', router: '路由器', server: '服务器', switch: '交换机' };
+const TYPE_ICON = { client: '⌘', router: '◇', server: '▣', switch: '▦' };
+const NODE_W = 154, NODE_H = 100;
 let topology = loadTopology();
 let selection = null;
 let pendingSource = null;
@@ -45,25 +45,126 @@ function worldPoint(clientX, clientY) { const rect = viewport.getBoundingClientR
 function renderTransform() { world.style.transform = `translate(${transform.x}px,${transform.y}px) scale(${transform.scale})`; $('#zoomLabel').textContent = `${Math.round(transform.scale * 100)}%`; }
 function nodeById(id) { return topology.nodes.find(n => n.id === id); }
 function degree(id) { return topology.links.filter(l => l.source === id || l.target === id).length; }
-function canConnect(id) { const n = nodeById(id); return n && (n.type === 'router' || degree(id) === 0); }
+function canConnect(id) { const n = nodeById(id); return n && (n.type === 'router' || n.type === 'switch' || degree(id) === 0); }
 function chooseSource(id) {
-  if (!canConnect(id)) { toast('客户端和服务器只能连接一条线'); return; }
+  if (!canConnect(id)) { toast('客户端和服务器只能连接一条线，请通过交换机连接多个设备'); return; }
   pendingSource = id; connectMode = true; $('#connectBtn').classList.add('active'); viewport.classList.add('connecting'); $('#canvasHint').textContent = `已选择 ${nodeById(id).name}，点击目标节点完成连接 · Esc 取消`;
   renderNodes();
 }
 function stopConnecting() { pendingSource = null; connectMode = false; $('#connectBtn').classList.remove('active'); viewport.classList.remove('connecting'); $('#canvasHint').textContent = '拖动节点布局 · 点击节点侧边的连接点创建连线'; renderNodes(); }
+function nodeKind(id) { return nodeById(id)?.type; }
+  function switchFamily(id) {
+    const family = new Set([id]), todo = [id];
+    while (todo.length) {
+      const current = todo.pop();
+      for (const l of topology.links) {
+        if (nodeKind(l.source) !== 'switch' || nodeKind(l.target) !== 'switch') continue;
+        const next = l.source === current ? l.target : l.target === current ? l.source : null;
+        if (next && !family.has(next)) {family.add(next); todo.push(next);}
+      }
+    }
+    return family;
+  }
+  function groupLinkIds(link) {
+    const switches = [link.source, link.target].filter(id => nodeKind(id) === 'switch');
+    if (!switches.length) return new Set([link.id]);
+    const family = switchFamily(switches[0]);
+    return new Set(topology.links.filter(l => family.has(l.source) || family.has(l.target)).map(l => l.id));
+  }
+  function groupForSwitch(id) {
+    const family = switchFamily(id);
+    return topology.links.filter(l => family.has(l.source) || family.has(l.target));
+  }
+  const uniqueSubnets = () => [...new Set(topology.links.map(l => l.subnet))];
+  function newSubnet() {
+    const used = uniqueSubnets();
+    for (let n = 1; n < 255; n++) {const cidr = `10.200.${n}.0/24`; if (!used.includes(cidr)) return cidr;}
+    throw new Error('自动分配网段已用尽，请手动编辑连线网段。');
+  }
+  function ipv4Number(ip) {
+    if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) return null;
+    const a = ip.split('.').map(Number);
+    if (a.some(v => v > 255)) return null;
+    return (((a[0] * 0x1000000) + (a[1] << 16) + (a[2] << 8) + a[3]) >>> 0);
+  }
+  const ipv4Text = n => [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+  function subnetRange(cidr) {
+    const [ip, prefixText] = String(cidr).split('/');
+    const n = ipv4Number(ip), prefix = Number(prefixText);
+    if (n === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 29 || prefixText === undefined) return null;
+    const size = 2 ** (32 - prefix), start = Math.floor(n / size) * size;
+    if (start !== n) return null;
+    return {start, end:start + size - 1, size};
+  }
+  function unusedIp(subnet, used) {
+    const range = subnetRange(subnet);
+    if (!range) throw new Error('网段格式错误：示例 10.200.1.0/24（最窄 /29）');
+    const first = range.start + (range.size > 12 ? 10 : 2);
+    for (let candidate = first; candidate < range.end; candidate++) {
+      const value = ipv4Text(candidate);
+      if (candidate !== range.start + 1 && !used.has(value)) {used.add(value); return value;}
+    }
+    for (let candidate = range.start + 2; candidate < first; candidate++) {
+      const value = ipv4Text(candidate);
+      if (!used.has(value)) {used.add(value); return value;}
+    }
+    throw new Error(`${subnet} 的可用地址不足，请改用更大的子网。`);
+  }
+  function newMac(extra = []) {
+    const used = new Set([...topology.links.flatMap(l => [l.sourceMac, l.targetMac].filter(Boolean)), ...extra].map(v => v.toLowerCase()));
+    for (let n = 1; n < 65535; n++) {
+      const mac = `02:42:ac:11:${((n >> 8) & 255).toString(16).padStart(2,'0')}:${(n & 255).toString(16).padStart(2,'0')}`;
+      if (!used.has(mac)) return mac;
+    }
+    throw new Error('MAC 地址已用尽');
+  }
+  function readdress(linkIds, subnet) {
+    const range = subnetRange(subnet);
+    if (!range) throw new Error('网段格式错误，请输入例如 10.200.1.0/24');
+    const otherUsed = new Set();
+    for (const l of topology.links) if (!linkIds.has(l.id)) for (const side of ['source','target']) if (l[side+'Ip']) otherUsed.add(l[side+'Ip']);
+    const modifications = [];
+    for (const l of topology.links) if (linkIds.has(l.id)) {
+      modifications.push([l,'subnet',subnet]);
+      for (const side of ['source','target']) if (nodeKind(l[side]) !== 'switch') modifications.push([l,side+'Ip',unusedIp(subnet, otherUsed)]);
+    }
+    for (const [link, field, value] of modifications) link[field] = value;
+  }
+  function createLink(a, b) {
+    if (a === b) throw new Error('不能连接节点自身');
+    if (topology.links.some(l => (l.source===a && l.target===b) || (l.source===b && l.target===a))) throw new Error('这两个节点已经连接');
+    for (const id of [a,b]) if (['client','server'].includes(nodeKind(id)) && topology.links.some(l => l.source===id || l.target===id)) throw new Error('客户端和服务器只能连接一条线；请通过交换机连接多台设备。');
+    const switchA = nodeKind(a)==='switch', switchB = nodeKind(b)==='switch';
+    if (!switchA && !switchB && a===b) throw new Error('无效连接');
+    let subnet;
+    if (switchA || switchB) {
+      const first = switchA ? groupForSwitch(a) : [];
+      const second = switchB ? groupForSwitch(b) : [];
+      subnet = first[0]?.subnet || second[0]?.subnet || newSubnet();
+      if (switchA && !switchB && first.some(l => l.source===b || l.target===b) ||
+          switchB && !switchA && second.some(l => l.source===a || l.target===a)) throw new Error('该设备已连接到同一个交换机网段，不能重复接入');
+      if (switchA && switchB && switchFamily(a).has(b)) throw new Error('这两台交换机已经处于同一个二层网段');
+    } else subnet = newSubnet();
+    const result = {id:nextId('link', topology.links),source:a,target:b,subnet,sourceIp:'',targetIp:'',sourceMac:'',targetMac:''};
+    const ips = new Set(topology.links.flatMap(l => [l.sourceIp,l.targetIp]).filter(Boolean));
+    for (const side of ['source','target']) if (nodeKind(result[side]) !== 'switch') {
+      result[side+'Ip'] = unusedIp(subnet, ips);
+      result[side+'Mac'] = newMac([result.sourceMac, result.targetMac]);
+    }
+    topology.links.push(result);
+    if (switchA && switchB) {
+      const ids = groupLinkIds(result);
+      const ranges = new Set([...ids].map(id => topology.links.find(l => l.id===id).subnet));
+      if (ranges.size > 1) readdress(ids, subnet);
+    }
+    selection = {kind:'link', id:result.id}; save(); stopConnecting(); render(); toast(`已连接：${subnet}`);
+  }
+
 function newLink(source, target) {
-  if (source === target) { toast('请选择另一个节点'); return; }
-  if (topology.links.some(l => [l.source, l.target].includes(source) && [l.source, l.target].includes(target))) { toast('这两个节点已经连接'); return; }
-  if (!canConnect(source) || !canConnect(target)) { toast('客户端和服务器只能连接一条线'); return; }
-  let i = 1;
-  while (topology.links.some(l => l.subnet === `10.200.${i}.0/24`)) i++;
-  if (i > 254) { toast('自动网段已用完，请手动修改现有网段'); return; }
-  const id = nextId('link', topology.links);
-  const hex = i.toString(16).padStart(2, '0');
-  const link = { id, source, target, subnet: `10.200.${i}.0/24`, sourceIp: `10.200.${i}.10`, targetIp: `10.200.${i}.11`, sourceMac: `02:42:c8:00:${hex}:01`, targetMac: `02:42:c8:00:${hex}:02` };
-  topology.links.push(link); selection = { kind: 'link', id }; save(); stopConnecting(); render(); toast('已连接节点，可在属性面板编辑地址');
+  try { createLink(source, target); }
+  catch (error) { toast(error.message); }
 }
+
 function addNode(type, x, y) {
   const id = nextId(type, topology.nodes);
   const count = topology.nodes.filter(n => n.type === type).length + 1;
@@ -80,13 +181,22 @@ function addNode(type, x, y) {
   topology.nodes.push({ id, name: `${TYPE_LABEL[type]} ${count}`, type, gui: false, x: Math.max(10, Math.min(2200, x)), y: Math.max(10, Math.min(1480, y)) });
   selection = { kind: 'node', id }; save(); render();
 }
+function nodeIps(node) {
+  if (node.type === 'switch') { const links = groupForSwitch(node.id); return links.length ? [links[0].subnet] : ['二层交换机 · 无 IP']; }
+  const ips = [];
+  for (const link of topology.links) {
+    if (link.source === node.id && link.sourceIp) ips.push(link.sourceIp);
+    if (link.target === node.id && link.targetIp) ips.push(link.targetIp);
+  }
+  return ips.length ? ips : ['未分配 IP'];
+}
 function renderNodes() {
   nodeLayer.replaceChildren();
   for (const node of topology.nodes) {
     const el = document.createElement('div');
     el.className = `topology-node ${node.type}${selection?.kind === 'node' && selection.id === node.id ? ' selected' : ''}${pendingSource === node.id ? ' pending' : ''}`;
     el.style.left = `${Number(node.x) || 0}px`; el.style.top = `${Number(node.y) || 0}px`; el.dataset.nodeId = node.id;
-    el.innerHTML = `<span class="node-icon">${TYPE_ICON[node.type] || '?'}</span><span class="node-copy"><strong>${esc(node.name)}</strong><span>${TYPE_LABEL[node.type] || node.type}${node.gui ? ' · GUI' : ''} · ${degree(node.id)} 条连接</span></span><span class="node-port" title="从此节点连接"></span>`;
+    el.innerHTML = `<span class="node-icon">${TYPE_ICON[node.type] || '?'}</span><span class="node-copy"><strong>${esc(node.name)}</strong><span>${TYPE_LABEL[node.type] || node.type}${node.gui ? ' · GUI' : ''} · ${degree(node.id)} 条连接</span><span class="node-ips">${nodeIps(node).map(ip => `<small>${esc(ip)}</small>`).join('')}</span></span><span class="node-port" title="从此节点连接"></span>`;
     el.querySelector('.node-port').addEventListener('pointerdown', event => event.stopPropagation());
     el.querySelector('.node-port').addEventListener('click', event => { event.stopPropagation(); if (pendingSource) newLink(pendingSource, node.id); else chooseSource(node.id); });
     el.addEventListener('pointerdown', event => {
@@ -129,17 +239,26 @@ function renderInspector() {
     const node = nodeById(selection.id);
     if (!node) { selection = null; renderInspector(); return; }
     const connected = topology.links.filter(l => l.source === node.id || l.target === node.id);
-    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>使用 kasmweb/ubuntu-focal-desktop:1.16.0</small></span></label>`}<div class="form-help">客户端、服务器可连接一条线；路由器可连接多个网段。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(l.source === node.id ? l.sourceIp : l.targetIp)}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
+    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机：同交换机网段的设备共享 Docker bridge，不需要配置 IP。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>使用 kasmweb/ubuntu-focal-desktop:1.16.0</small></span></label>`}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
     body.querySelector('[data-node-field="name"]').addEventListener('input', event => { node.name = event.target.value; save(); renderNodes(); });
-    body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (event.target.value !== 'router' && degree(node.id) > 1) { toast('多连接节点必须保持为路由器'); event.target.value = node.type; return; } node.type = event.target.value; if (node.type === 'router') node.gui = false; save(); render(); });
+    body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; save(); render(); });
     body.querySelector('[data-node-field="gui"]')?.addEventListener('change', event => { node.gui = event.target.checked; save(); renderNodes(); });
     return;
   }
   const link = topology.links.find(l => l.id === selection.id);
   if (!link) { selection = null; renderInspector(); return; }
   const a = nodeById(link.source), b = nodeById(link.target);
-  body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">LINK / ${esc(link.id)}</div><div class="inspector-heading">${esc(a.name)} ↔ ${esc(b.name)}</div><label class="form-field"><span>网络网段 CIDR</span><input data-link-field="subnet" value="${esc(link.subnet)}" spellcheck="false"></label><div class="form-help">每条连接独占一个 Docker bridge 网络。</div><div class="inspector-divider"></div>${['source','target'].map((side, i) => `<div class="endpoint-title">${i ? esc(b.name) : esc(a.name)} <small>${i ? '目标接口' : '源接口'}</small></div><label class="form-field"><span>IPv4 地址</span><input data-link-field="${side}Ip" value="${esc(link[side + 'Ip'])}" spellcheck="false"></label><label class="form-field"><span>MAC 地址</span><input data-link-field="${side}Mac" value="${esc(link[side + 'Mac'])}" spellcheck="false"></label>${i ? '' : '<div class="inspector-divider"></div>'}`).join('')}</div>`;
-  body.querySelectorAll('[data-link-field]').forEach(input => input.addEventListener('input', event => { link[event.target.dataset.linkField] = event.target.value; save(); renderEdges(); }));
+  const group = groupLinkIds(link);
+  const isShared = group.size > 1;
+  body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">LINK / ${esc(link.id)}</div><div class="inspector-heading">${esc(a.name)} ↔ ${esc(b.name)}</div><label class="form-field"><span>网络网段 CIDR</span><input data-link-field="subnet" value="${esc(link.subnet)}" spellcheck="false"></label><div class="form-help">${isShared ? '交换机连接共享一个 Docker bridge 网段。修改网段会同步调整同网段接口。' : '直连链路对应独立的 Docker bridge 网络。'}</div><div class="inspector-divider"></div>${['source','target'].map((side, i) => {
+    const node = i ? b : a;
+    return `<div class="endpoint-title">${esc(node.name)} <small>${i ? '目标接口' : '源接口'}</small></div>${node.type === 'switch' ? '<div class="form-help">二层交换机端口（无 IP/MAC）</div>' : `<label class="form-field"><span>IPv4 地址</span><input data-link-field="${side}Ip" value="${esc(link[side + 'Ip'])}" spellcheck="false"></label><label class="form-field"><span>MAC 地址</span><input data-link-field="${side}Mac" value="${esc(link[side + 'Mac'])}" spellcheck="false"></label>`}${i ? '' : '<div class="inspector-divider"></div>'}`;
+  }).join('')}</div>`;
+  body.querySelectorAll('[data-link-field]').forEach(input => input.addEventListener('change', event => {
+    const field = event.target.dataset.linkField;
+    try { if (field === 'subnet') readdress(groupLinkIds(link), event.target.value.trim()); else link[field] = event.target.value.trim(); save(); render(); }
+    catch (error) { toast(error.message); renderInspector(); }
+  }));
 }
 function render() { renderNodes(); renderEdges(); renderInspector(); $('#counts').textContent = `${topology.nodes.length} 个节点 · ${topology.links.length} 条连线`; renderTransform(); }
 function deleteSelected() {
