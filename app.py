@@ -252,15 +252,16 @@ def dockerfile(kind: str, gui: bool = False) -> str:
     if gui:
         return (f"FROM {GUI_IMAGE}\n"
                 f"LABEL topology.role={kind}\n")
-    base = "python:3.12-alpine" if kind == "server" else "alpine:3.21"
-    return (f"FROM {base}\n"
-            "RUN apk add --no-cache bash bash-completion coreutils findutils grep sed "
-            "less nano vim procps util-linux iproute2 iputils "
-            "bind-tools traceroute curl wget tcpdump net-tools\n"
+    return ("FROM ubuntu:24.04\n"
+            "ENV DEBIAN_FRONTEND=noninteractive\n"
+            "RUN apt-get update && apt-get install -y --no-install-recommends "
+            "bash bash-completion ca-certificates coreutils findutils grep sed less nano vim "
+            "procps util-linux iproute2 iputils-ping dnsutils traceroute "
+            "curl wget tcpdump net-tools hping3 nmap python3 python3-scapy "
+            "&& rm -rf /var/lib/apt/lists/*\n"
             "ENV SHELL=/bin/bash HOME=/root TERM=xterm-256color\n"
             "WORKDIR /root\n"
-            "RUN printf '%s\\n' 'export PS1=\"\\u@\\h:\\w\\$ \"' > /root/.bashrc "
-            "&& printf '%s\\n' '[ -f /root/.bashrc ] && . /root/.bashrc' > /root/.bash_profile\n"
+            "RUN printf '%s\\n' 'export PS1=\"\\u@\\h:\\w\\$ \"' > /root/.bashrc\n"
             "CMD [\"/bin/bash\"]\n"
             f"LABEL topology.role={kind}\n")
 
