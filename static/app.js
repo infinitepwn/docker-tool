@@ -306,6 +306,33 @@ async function download() {
   } catch (error) { toast(error.message); }
 }
 
+async function saveLocal() {
+  const button = $('#saveLocalBtn');
+  const previous = localStorage.getItem('topology-output-directory') || '~/Documents/Cybersecurity-lab/lab3';
+  const directory = prompt('选择生成目录（输入本机绝对路径，支持 ~/ 开头）：\n例如 ~/Documents/Cybersecurity-lab/lab3\n\n目录不存在时会自动创建。', previous);
+  if (directory === null) return;
+  if (!directory.trim()) { toast('请输入生成目录'); return; }
+  button.disabled = true;
+  try {
+    const send = async (confirmOverwrite) => {
+      const response = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...topology,outputDirectory:directory.trim(),confirmOverwrite})});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `保存失败 (${response.status})`);
+      return result;
+    };
+    let result = await send(false);
+    if (result.needsConfirmation) {
+      const names = result.overwritten.slice(0, 12).join('\n');
+      if (!confirm(`将覆盖以下已有文件（其他文件不会删除）：\n${result.directory}\n\n${names}${result.overwritten.length > 12 ? '\n…' : ''}\n\n确认继续？`)) return;
+      result = await send(true);
+    }
+    localStorage.setItem('topology-output-directory', directory.trim());
+    toast(`已写入 ${result.written.length} 个文件：${result.directory}`);
+    alert(`已生成到本地：\n${result.directory}\n\n进入该目录运行：docker compose up -d --build --force-recreate`);
+  } catch (error) { toast(error.message); }
+  finally { button.disabled = false; }
+}
+
 document.querySelectorAll('[data-add]').forEach(button => {
   button.addEventListener('click', () => { const rect = viewport.getBoundingClientRect(); const p = worldPoint(rect.left + rect.width / 2, rect.top + rect.height / 2); addNode(button.dataset.add, p.x - NODE_W / 2 + (topology.nodes.length % 3) * 28, p.y - NODE_H / 2 + (topology.nodes.length % 3) * 25); });
   button.addEventListener('dragstart', event => event.dataTransfer.setData('text/plain', button.dataset.add));
@@ -318,7 +345,7 @@ viewport.addEventListener('pointerup', () => { if (dragging?.kind === 'node') { 
 viewport.addEventListener('wheel', event => { if (!event.ctrlKey && !event.metaKey) return; event.preventDefault(); zoom(event.deltaY < 0 ? 1.08 : .92); }, {passive:false});
 $('#connectBtn').addEventListener('click', () => { if (connectMode) stopConnecting(); else { connectMode = true; $('#connectBtn').classList.add('active'); viewport.classList.add('connecting'); $('#canvasHint').textContent = '点击第一个节点，再点击目标节点 · Esc 取消'; } });
 $('#zoomIn').addEventListener('click', () => zoom(1.2)); $('#zoomOut').addEventListener('click', () => zoom(1/1.2)); $('#fitBtn').addEventListener('click', fitView);
-$('#deleteBtn').addEventListener('click', deleteSelected); $('#previewBtn').addEventListener('click', preview); $('#downloadBtn').addEventListener('click', download);
+$('#deleteBtn').addEventListener('click', deleteSelected); $('#previewBtn').addEventListener('click', preview); $('#downloadBtn').addEventListener('click', download); $('#saveLocalBtn').addEventListener('click', saveLocal);
 $('#copyBtn').addEventListener('click', async () => { if (!generated || !activeFile) return; await navigator.clipboard.writeText(generated.files[activeFile]); toast('已复制文件内容'); });
 $('#sampleBtn').addEventListener('click', () => { topology = demoTopology(); selection = null; stopConnecting(); save(); render(); fitView(); toast('已加载示例拓扑'); });
 $('#clearBtn').addEventListener('click', () => { if (!confirm('清空当前拓扑？此操作会删除所有节点和连线。')) return; topology = {nodes:[],links:[]}; selection = null; stopConnecting(); save(); render(); $('#fileList').innerHTML = '<div class="empty-file">尚未生成文件</div>'; $('#codeContent').textContent = '添加节点与连线后，点击“刷新预览”。'; $('#warnings').textContent = ''; toast('画布已清空'); });
