@@ -37,6 +37,8 @@ class GeneratorTests(unittest.TestCase):
     def test_rejects_overlapping_networks(self):
         data = topology()
         data["links"][1]["subnet"] = "10.200.1.128/25"
+        data["links"][1]["sourceIp"] = "10.200.1.130"
+        data["links"][1]["targetIp"] = "10.200.1.131"
         with self.assertRaisesRegex(TopologyError, "重叠"):
             build_files(data)
 

@@ -26,3 +26,5 @@
 .node-ips small{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:#237981;overflow-wrap:anywhere;max-width:95px}
 .node-port{top:38px}
 .canvas-footer{flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+.top-actions{justify-content:flex-end;flex-wrap:wrap}
+@media(max-width:850px){.top-actions{justify-content:flex-start}}

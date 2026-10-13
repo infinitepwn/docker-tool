@@ -22,7 +22,7 @@
         <div class="guide-step"><b>01</b><span>添加节点并拖动布局</span></div>
         <div class="guide-step"><b>02</b><span>点击节点连接点，再点击目标节点</span></div>
         <div class="guide-step"><b>03</b><span>选中连线设置网段、IP 和 MAC</span></div>
-        <div class="guide-step"><b>04</b><span>预览配置并下载 Docker 项目</span></div>
+        <div class="guide-step"><b>04</b><span>保存拓扑或生成 Docker 项目</span></div>
       </div>
       <div class="sidebar-bottom"><span class="status-dot"></span> 本地运行 · 自动保存</div>
     </aside>
@@ -30,7 +30,7 @@
     <main class="main">
       <header class="topbar">
         <div class="heading"><span class="eyebrow">WORKSPACE / NETWORK TOPOLOGY</span><h1>网络拓扑设计器</h1><p>画出网络结构，生成可运行的 Docker Compose 项目。</p></div>
-        <div class="top-actions"><button class="quiet-button" id="sampleBtn">加载示例</button><button class="quiet-button" id="clearBtn">清空画布</button><button class="secondary-button" id="saveLocalBtn">↧ 选择目录并生成</button><button class="primary-button" id="downloadBtn"><span>↓</span> 下载项目 ZIP</button></div>
+        <div class="top-actions"><button class="quiet-button" id="sampleBtn">加载示例</button><button class="quiet-button" id="clearBtn">清空画布</button><button class="quiet-button" id="openTopologyBtn">打开拓扑</button><button class="secondary-button" id="saveTopologyBtn">保存拓扑</button><button class="secondary-button" id="saveLocalBtn">▣ 选择文件夹并生成</button><button class="primary-button" id="downloadBtn"><span>↓</span> 下载项目 ZIP</button></div>
       </header>
 
       <div class="workspace">
@@ -46,6 +46,7 @@
       <section class="output-panel"><div class="output-header"><div><span class="eyebrow">GENERATED OUTPUT</span><h2>生成预览</h2><p>拓扑变化后点击刷新预览，检查即将下载的文件。</p></div><button class="secondary-button" id="previewBtn">↻ 刷新预览</button></div><div class="output-content"><div class="file-list" id="fileList"><div class="empty-file">尚未生成文件</div></div><div class="code-pane"><div class="code-title"><span id="fileTitle">选择文件查看内容</span><button id="copyBtn" title="复制内容" disabled>复制</button></div><pre id="codeContent">添加节点与连线后，点击“刷新预览”。</pre></div></div><div class="warning-list" id="warnings"></div></section>
     </main>
   </div>
+  <input type="file" id="topologyFileInput" accept="application/json,.json" hidden>
   <div class="toast" id="toast" role="status"></div>
   <script src="/app.js"></script>
 </body>

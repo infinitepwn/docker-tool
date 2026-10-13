@@ -4,6 +4,8 @@ const world = $('#world');
 const nodeLayer = $('#nodes');
 const edgeLayer = $('#edges');
 const STORAGE_KEY = 'topology-lab-v1';
+const TOPOLOGY_FORMAT = 'topology-lab';
+const TOPOLOGY_VERSION = 1;
 const TYPE_LABEL = { client: '客户端', router: '路由器', server: '服务器', switch: '交换机' };
 const TYPE_ICON = { client: '⌘', router: '◇', server: '▣', switch: '▦' };
 const NODE_W = 154, NODE_H = 100;
@@ -38,6 +40,77 @@ function loadTopology() {
   return demoTopology();
 }
 function save() { localStorage.setItem(STORAGE_KEY, JSON.stringify(topology)); generated = null; $('#fileTitle').textContent = activeFile ? `${activeFile} · 需刷新` : '选择文件查看内容'; }
+function topologyDocument() {
+  return {format: TOPOLOGY_FORMAT, version: TOPOLOGY_VERSION, savedAt: new Date().toISOString(), viewport: {...transform}, nodes: topology.nodes, links: topology.links};
+}
+function topologyFilename() {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+  return `network-topology-${stamp}.json`;
+}
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob); const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = filename; document.body.appendChild(anchor); anchor.click(); anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+async function saveTopologyFile() {
+  const body = JSON.stringify(topologyDocument(), null, 2) + '\n';
+  try {
+    if (typeof window.showSaveFilePicker === 'function') {
+      const handle = await window.showSaveFilePicker({id:'topology-json', suggestedName:topologyFilename(), types:[{description:'网络拓扑 JSON', accept:{'application/json':['.json']}}]});
+      const writable = await handle.createWritable();
+      try { await writable.write(body); await writable.close(); }
+      catch (error) { try { await writable.abort(); } catch (_) {} throw error; }
+    } else triggerDownload(new Blob([body], {type:'application/json'}), topologyFilename());
+    toast('当前网络拓扑已保存');
+  } catch (error) { if (error.name !== 'AbortError') toast(`保存拓扑失败：${error.message}`); }
+}
+function validateTopologyDocument(document) {
+  if (!document || typeof document !== 'object') throw new Error('拓扑文件格式错误');
+  if (document.format && document.format !== TOPOLOGY_FORMAT) throw new Error('这不是拓扑工坊文件');
+  if (document.version !== undefined && document.version !== TOPOLOGY_VERSION) throw new Error(`不支持的拓扑文件版本：${document.version}`);
+  if (!Array.isArray(document.nodes) || !Array.isArray(document.links)) throw new Error('拓扑文件缺少 nodes 或 links');
+  if (document.nodes.length > 80 || document.links.length > 160) throw new Error('拓扑规模超过限制');
+  const ids = new Set();
+  const nodes = document.nodes.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id.trim() || raw.id.length > 80 || ids.has(raw.id) || !TYPE_LABEL[raw.type]) throw new Error(`第 ${index + 1} 个节点无效`);
+    if (raw.name !== undefined && (typeof raw.name !== 'string' || raw.name.length > 200)) throw new Error(`第 ${index + 1} 个节点名称无效`);
+    ids.add(raw.id);
+    const x = Number.isFinite(Number(raw.x)) ? Number(raw.x) : 120 + index * 35;
+    const y = Number.isFinite(Number(raw.y)) ? Number(raw.y) : 160 + index * 25;
+    return {id:raw.id, name:typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : raw.id, type:raw.type, gui:(raw.type === 'client' || raw.type === 'server') && raw.gui === true, x:Math.max(0, Math.min(2240, x)), y:Math.max(0, Math.min(1520, y))};
+  });
+  const linkIds = new Set();
+  const links = document.links.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id.trim() || raw.id.length > 80 || linkIds.has(raw.id) || !ids.has(raw.source) || !ids.has(raw.target) || raw.source === raw.target) throw new Error(`第 ${index + 1} 条连线无效`);
+    const fields = ['subnet','sourceIp','targetIp','sourceMac','targetMac'];
+    if (fields.some(field => raw[field] !== undefined && (typeof raw[field] !== 'string' || raw[field].length > 200))) throw new Error(`第 ${index + 1} 条连线配置无效`);
+    linkIds.add(raw.id);
+    return {id:raw.id, source:raw.source, target:raw.target, subnet:raw.subnet || '', sourceIp:raw.sourceIp || '', targetIp:raw.targetIp || '', sourceMac:raw.sourceMac || '', targetMac:raw.targetMac || ''};
+  });
+  const view = document.viewport;
+  const viewportState = view && [view.x, view.y, view.scale].every(value => Number.isFinite(Number(value))) ? {x:Number(view.x), y:Number(view.y), scale:Math.max(.45, Math.min(1.7, Number(view.scale)))} : null;
+  return {nodes, links, viewportState};
+}
+async function chooseTopologyFile() {
+  if (typeof window.showOpenFilePicker === 'function') {
+    const [handle] = await window.showOpenFilePicker({id:'topology-json', multiple:false, types:[{description:'网络拓扑 JSON', accept:{'application/json':['.json']}}]});
+    return handle.getFile();
+  }
+  return new Promise(resolve => {
+    const input = $('#topologyFileInput'); input.value = '';
+    input.onchange = () => resolve(input.files?.[0] || null); input.click();
+  });
+}
+async function openTopologyFile() {
+  try {
+    const file = await chooseTopologyFile(); if (!file) return;
+    if (file.size > 2_000_000) throw new Error('拓扑文件不能超过 2 MB');
+    const parsed = validateTopologyDocument(JSON.parse(await file.text()));
+    topology = {nodes:parsed.nodes, links:parsed.links}; selection = null; stopConnecting(); save(); render();
+    if (parsed.viewportState) { transform = parsed.viewportState; renderTransform(); } else fitView();
+    toast(`已打开拓扑：${file.name}`);
+  } catch (error) { if (error.name !== 'AbortError') toast(`打开拓扑失败：${error.message}`); }
+}
 function esc(value) { return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function toast(message) { const el = $('#toast'); el.textContent = message; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 3200); }
 function nextId(prefix, values) { let n = 1; while (values.some(item => item.id === `${prefix}-${n}`)) n++; return `${prefix}-${n}`; }
@@ -288,47 +361,84 @@ function showFile(name) {
   $('#copyBtn').disabled = !!asset;
   document.querySelectorAll('.file-item').forEach(el => el.classList.toggle('active', el.dataset.file === name));
 }
+function showGenerated(result) {
+  generated = result;
+  const list = $('#fileList'); list.replaceChildren();
+  Object.keys(result.files).sort((a,b) => a === 'compose.yaml' ? -1 : b === 'compose.yaml' ? 1 : a.localeCompare(b)).forEach(name => {
+    const button = document.createElement('button'); button.className = 'file-item'; button.dataset.file = name; button.textContent = `▤  ${name}`; button.addEventListener('click', () => showFile(name)); list.appendChild(button);
+  });
+  (result.assets || []).forEach(asset => { const button = document.createElement('button'); button.className = 'file-item'; button.dataset.file = asset.path; button.textContent = `▣  ${asset.path}`; button.addEventListener('click', () => showFile(asset.path)); list.appendChild(button); });
+  $('#warnings').textContent = result.warnings.length ? `⚠ ${result.warnings.join('；')}` : '';
+  showFile(result.files[activeFile] || result.assets?.some(asset => asset.path === activeFile) ? activeFile : 'compose.yaml');
+}
 async function preview() {
   try {
-    const result = await (await request('/api/preview')).json(); generated = result;
-    const list = $('#fileList'); list.replaceChildren();
-    Object.keys(result.files).sort((a,b) => a === 'compose.yaml' ? -1 : b === 'compose.yaml' ? 1 : a.localeCompare(b)).forEach(name => {
-      const button = document.createElement('button'); button.className = 'file-item'; button.dataset.file = name; button.textContent = `▤  ${name}`; button.addEventListener('click', () => showFile(name)); list.appendChild(button);
-    });
-    (result.assets || []).forEach(asset => { const button = document.createElement('button'); button.className = 'file-item'; button.dataset.file = asset.path; button.textContent = `▣  ${asset.path}`; button.addEventListener('click', () => showFile(asset.path)); list.appendChild(button); });
-    $('#warnings').textContent = result.warnings.length ? `⚠ ${result.warnings.join('；')}` : '';
-    showFile(result.files[activeFile] || result.assets?.some(asset => asset.path === activeFile) ? activeFile : 'compose.yaml'); toast('配置已生成');
+    showGenerated(await (await request('/api/preview')).json()); toast('配置已生成');
   } catch (error) { toast(error.message); }
 }
 async function download() {
   try {
-    const blob = await (await request('/api/download')).blob(); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'topology-lab.zip'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000); toast('Docker 项目已下载');
+    triggerDownload(await (await request('/api/download')).blob(), 'topology-lab.zip'); toast('Docker 项目已下载');
   } catch (error) { toast(error.message); }
 }
 
+function safePathParts(path) {
+  if (typeof path !== 'string' || !path || path.length > 500 || path.startsWith('/') || path.includes('\\') || path.includes('\0')) throw new Error(`不安全的文件路径：${path}`);
+  const parts = path.split('/');
+  if (parts.some(part => !part || part === '.' || part === '..')) throw new Error(`不安全的文件路径：${path}`);
+  return parts;
+}
+async function parentDirectory(root, path, create) {
+  const parts = safePathParts(path); const filename = parts.pop(); let directory = root;
+  for (const part of parts) directory = await directory.getDirectoryHandle(part, {create});
+  return {directory, filename};
+}
+async function existingFile(root, path) {
+  try {
+    const {directory, filename} = await parentDirectory(root, path, false);
+    await directory.getFileHandle(filename, {create:false}); return true;
+  } catch (error) {
+    if (error.name === 'NotFoundError') return false;
+    throw error;
+  }
+}
+async function writeDirectoryFile(root, path, contents) {
+  const {directory, filename} = await parentDirectory(root, path, true);
+  const handle = await directory.getFileHandle(filename, {create:true});
+  const writable = await handle.createWritable();
+  try { await writable.write(contents); await writable.close(); }
+  catch (error) { try { await writable.abort(); } catch (_) {} throw error; }
+}
 async function saveLocal() {
   const button = $('#saveLocalBtn');
-  const previous = localStorage.getItem('topology-output-directory') || '~/Documents/Cybersecurity-lab/lab3';
-  const directory = prompt('选择生成目录（输入本机绝对路径，支持 ~/ 开头）：\n例如 ~/Documents/Cybersecurity-lab/lab3\n\n目录不存在时会自动创建。', previous);
-  if (directory === null) return;
-  if (!directory.trim()) { toast('请输入生成目录'); return; }
+  if (typeof window.showDirectoryPicker !== 'function') { toast('当前浏览器不支持文件夹选择，改为下载 ZIP'); await download(); return; }
+  let directory;
+  try { directory = await window.showDirectoryPicker({id:'topology-project-output', mode:'readwrite', startIn:'documents'}); }
+  catch (error) { if (error.name !== 'AbortError') toast(`选择文件夹失败：${error.message}`); return; }
   button.disabled = true;
   try {
-    const send = async (confirmOverwrite) => {
-      const response = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...topology,outputDirectory:directory.trim(),confirmOverwrite})});
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error || `保存失败 (${response.status})`);
-      return result;
-    };
-    let result = await send(false);
-    if (result.needsConfirmation) {
-      const names = result.overwritten.slice(0, 12).join('\n');
-      if (!confirm(`将覆盖以下已有文件（其他文件不会删除）：\n${result.directory}\n\n${names}${result.overwritten.length > 12 ? '\n…' : ''}\n\n确认继续？`)) return;
-      result = await send(true);
+    const result = generated || await (await request('/api/preview')).json();
+    if (!generated) showGenerated(result);
+    const entries = Object.entries(result.files).map(([path, contents]) => ({path, contents}));
+    for (const asset of result.assets || []) {
+      if (typeof asset.downloadUrl !== 'string' || !asset.downloadUrl.startsWith('/api/assets/')) throw new Error(`资产地址无效：${asset.path}`);
+      const response = await fetch(asset.downloadUrl, {cache:'no-store'});
+      if (!response.ok) throw new Error(`无法读取 ${asset.path} (${response.status})`);
+      entries.push({path:asset.path, contents:await response.blob()});
     }
-    localStorage.setItem('topology-output-directory', directory.trim());
-    toast(`已写入 ${result.written.length} 个文件：${result.directory}`);
-    alert(`已生成到本地：\n${result.directory}\n\n进入该目录运行：docker compose up -d --build --force-recreate`);
+    const overwritten = [];
+    for (const entry of entries) if (await existingFile(directory, entry.path)) overwritten.push(entry.path);
+    if (overwritten.length) {
+      const names = overwritten.slice(0, 12).join('\n');
+      if (!confirm(`所选文件夹中已有以下文件：\n\n${names}${overwritten.length > 12 ? '\n…' : ''}\n\n确认覆盖？其他文件不会删除。`)) return;
+    }
+    let written = 0;
+    for (const entry of entries) {
+      try { await writeDirectoryFile(directory, entry.path, entry.contents); written++; }
+      catch (error) { throw new Error(`写入中断（已完成 ${written}/${entries.length}）：${entry.path}：${error.message}`); }
+    }
+    toast(`已向“${directory.name}”写入 ${entries.length} 个文件`);
+    alert(`项目已生成到文件夹“${directory.name}”。\n\n在该目录运行：docker compose up -d --build --force-recreate`);
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
 }
@@ -346,6 +456,7 @@ viewport.addEventListener('wheel', event => { if (!event.ctrlKey && !event.metaK
 $('#connectBtn').addEventListener('click', () => { if (connectMode) stopConnecting(); else { connectMode = true; $('#connectBtn').classList.add('active'); viewport.classList.add('connecting'); $('#canvasHint').textContent = '点击第一个节点，再点击目标节点 · Esc 取消'; } });
 $('#zoomIn').addEventListener('click', () => zoom(1.2)); $('#zoomOut').addEventListener('click', () => zoom(1/1.2)); $('#fitBtn').addEventListener('click', fitView);
 $('#deleteBtn').addEventListener('click', deleteSelected); $('#previewBtn').addEventListener('click', preview); $('#downloadBtn').addEventListener('click', download); $('#saveLocalBtn').addEventListener('click', saveLocal);
+$('#saveTopologyBtn').addEventListener('click', saveTopologyFile); $('#openTopologyBtn').addEventListener('click', openTopologyFile);
 $('#copyBtn').addEventListener('click', async () => { if (!generated || !activeFile) return; await navigator.clipboard.writeText(generated.files[activeFile]); toast('已复制文件内容'); });
 $('#sampleBtn').addEventListener('click', () => { topology = demoTopology(); selection = null; stopConnecting(); save(); render(); fitView(); toast('已加载示例拓扑'); });
 $('#clearBtn').addEventListener('click', () => { if (!confirm('清空当前拓扑？此操作会删除所有节点和连线。')) return; topology = {nodes:[],links:[]}; selection = null; stopConnecting(); save(); render(); $('#fileList').innerHTML = '<div class="empty-file">尚未生成文件</div>'; $('#codeContent').textContent = '添加节点与连线后，点击“刷新预览”。'; $('#warnings').textContent = ''; toast('画布已清空'); });

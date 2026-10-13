@@ -4,9 +4,6 @@
 from __future__ import annotations
 
 import io
-import os
-import tempfile
-import shutil
 import ipaddress
 import json
 import re
@@ -392,78 +389,13 @@ def make_archive(files: dict[str, str], include_openwrt: bool) -> bytes:
     return buffer.getvalue()
 
 
-def output_directory() -> Path:
-    """Writable destination is controlled by the local operator, never by a browser path."""
-    return Path(os.environ.get("TOPOLOGY_OUTPUT_DIR", str(ROOT / "generated-lab"))).expanduser().resolve()
-
-
-def selected_output_directory(directory: str | None) -> Path:
-    if directory is None or not directory.strip():
-        return output_directory()
-    if not isinstance(directory, str) or len(directory) > 2048 or "\x00" in directory:
-        raise TopologyError("生成目录格式错误")
-    path = Path(os.path.expandvars(directory.strip())).expanduser()
-    if not path.is_absolute():
-        raise TopologyError("请输入绝对路径，例如 ~/Documents/Cybersecurity-lab/lab3")
-    # Local writes are allowed only within the current account's home directory,
-    # the editor's project directory or its explicitly configured output folder.
-    resolved = path.resolve()
-    allowed_roots = [Path.home().resolve(), ROOT.resolve(), output_directory()]
-    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
-        raise TopologyError("目录超出允许范围：请选择当前用户主目录下的文件夹")
-    if path.is_symlink():
-        raise TopologyError("不允许使用符号链接作为生成目录")
-    if resolved.exists() and not resolved.is_dir():
-        raise TopologyError("所选路径不是目录")
-    return resolved
-
-
-def save_to_local(files: dict[str, str], include_openwrt: bool, confirm: bool = False, directory: str | None = None) -> dict:
-    target = selected_output_directory(directory)
-    contents = dict(files)
-    asset_names = [OPENWRT_BUNDLE_PATH] if include_openwrt else []
-    paths = list(contents) + asset_names
-    for name in paths:
-        relative = Path(name)
-        if relative.is_absolute() or not relative.parts or ".." in relative.parts or any(part in ("", ".") for part in relative.parts):
-            raise TopologyError(f"不允许的输出文件路径：{name}")
-        path = target / relative
-        current = target
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                raise TopologyError(f"不允许覆盖符号链接：{name}")
-        if path.exists() and not path.is_file():
-            raise TopologyError(f"目标位置不是普通文件：{name}")
-    overwritten = [name for name in paths if (target / name).is_file()]
-    if overwritten and not confirm:
-        return {"needsConfirmation": True, "directory": str(target), "overwritten": overwritten, "written": []}
-    target.mkdir(parents=True, exist_ok=True)
-    for name in paths:
-        destination = target / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        # Stage alongside each destination then atomically replace its contents.
-        fd, temporary = tempfile.mkstemp(prefix=".topology-", dir=destination.parent)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                if name in contents:
-                    stream.write(contents[name].encode("utf-8"))
-                else:
-                    with OPENWRT_ARCHIVE.open("rb") as source:
-                        shutil.copyfileobj(source, stream)
-            os.replace(temporary, destination)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-    return {"needsConfirmation": False, "directory": str(target), "overwritten": overwritten, "written": paths}
-
-
 class Handler(BaseHTTPRequestHandler):
     def send_bytes(self, status: int, body: bytes, mime: str, filename: str | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         if filename:
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
@@ -471,6 +403,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/assets/openwrt-rootfs":
+            if not OPENWRT_ARCHIVE.is_file():
+                self.send_error(404)
+                return
+            self.send_bytes(200, OPENWRT_ARCHIVE.read_bytes(), "application/gzip")
+            return
         names = {"/": ("index.html", "text/html; charset=utf-8"),
                  "/styles.css": ("styles.css", "text/css; charset=utf-8"),
                  "/app.js": ("app.js", "text/javascript; charset=utf-8")}
@@ -481,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, (STATIC / filename).read_bytes(), mime)
 
     def do_POST(self) -> None:
-        if self.path not in ("/api/preview", "/api/download", "/api/save"):
+        if self.path not in ("/api/preview", "/api/download"):
             self.send_error(404)
             return
         try:
@@ -489,26 +427,15 @@ class Handler(BaseHTTPRequestHandler):
             if length < 1 or length > 1_000_000:
                 raise TopologyError("请求内容过大或为空")
             data = json.loads(self.rfile.read(length))
-            confirm = False
-            if self.path == "/api/save":
-                if self.client_address[0] not in ("127.0.0.1", "::1"):
-                    raise TopologyError("本地写入仅允许在本机运行的编辑器使用")
-                if not isinstance(data, dict):
-                    raise TopologyError("拓扑数据格式错误")
-                confirm = data.pop("confirmOverwrite", False) is True
-                selected_directory = data.pop("outputDirectory", None)
-                if selected_directory is not None and not isinstance(selected_directory, str):
-                    raise TopologyError("生成目录必须是字符串")
             files, warnings = build_files(data)
             has_router = any(node["type"] == "router" for node in normalize(data)[0])
             if self.path == "/api/preview":
-                assets = ([{"path": OPENWRT_BUNDLE_PATH, "size": OPENWRT_ARCHIVE.stat().st_size}]
+                assets = ([{"path": OPENWRT_BUNDLE_PATH,
+                            "size": OPENWRT_ARCHIVE.stat().st_size,
+                            "downloadUrl": "/api/assets/openwrt-rootfs"}]
                           if has_router else [])
                 body = json.dumps({"files": files, "assets": assets, "warnings": warnings}, ensure_ascii=False).encode()
                 self.send_bytes(200, body, "application/json; charset=utf-8")
-            elif self.path == "/api/save":
-                result = save_to_local(files, has_router, confirm, selected_directory)
-                self.send_bytes(200, json.dumps(result, ensure_ascii=False).encode(), "application/json; charset=utf-8")
             else:
                 self.send_bytes(200, make_archive(files, has_router), "application/zip", "topology-lab.zip")
         except (TopologyError, json.JSONDecodeError, OSError) as exc:
