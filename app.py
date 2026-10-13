@@ -20,10 +20,12 @@ STATIC = ROOT / "static"
 OPENWRT_ARCHIVE = ROOT / "assets" / "openwrt-armsr-armv8-rootfs.tar.gz"
 OPENWRT_BUNDLE_PATH = "assets/openwrt-armsr-armv8-rootfs.tar.gz"
 GUI_IMAGE = "kasmweb/ubuntu-focal-desktop:1.16.0"
+GUI_USERNAME = "kasm_user"
 KINDS = {"client", "router", "server", "switch"}
 ID_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,39}$")
 MAC_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 HOSTNAME_PATTERN = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+GUI_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 class TopologyError(ValueError):
@@ -265,6 +267,13 @@ def dockerfile(kind: str, gui: bool = False) -> str:
 
 def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     nodes, links = normalize(data)
+    gui_nodes = [node for node in nodes if node["gui"]]
+    gui_password = data.get("guiPassword") if isinstance(data, dict) else None
+    if gui_nodes:
+        if gui_password is None:
+            gui_password = secrets.token_urlsafe(16)
+        if not isinstance(gui_password, str) or not GUI_PASSWORD_PATTERN.fullmatch(gui_password):
+            raise TopologyError("GUI 密码必须为 8–64 位字母、数字、下划线或连字符")
     has_router = any(node["type"] == "router" for node in nodes)
     if has_router and not OPENWRT_ARCHIVE.is_file():
         raise TopologyError("缺少 OpenWrt rootfs，请将归档放入 assets/openwrt-armsr-armv8-rootfs.tar.gz")
@@ -349,7 +358,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         ])
     files["compose.yaml"] = "\n".join(lines) + "\n"
     if gui_ports:
-        files[".env"] = "VNC_PW=" + secrets.token_urlsafe(16) + "\n"
+        files[".env"] = f"VNC_PW={gui_password}\n"
     readme = ["# Generated topology", "", "Run `docker compose up --build -d` in this directory.", "Use `docker compose ps` to inspect containers and `docker compose down` to stop them.", "", "## Nodes", ""]
     for node in nodes:
         suffix = "，GUI" if node["gui"] else ""
@@ -366,7 +375,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         target_ip = link['targetIp'] if kinds[link['target']] != 'switch' else 'switch port'
         readme.append(f"- `{link['source']}` ↔ `{link['target']}`: `{link['subnet']}`; {source_ip} / {target_ip}")
     if gui_ports:
-        readme.extend(["", "## GUI access", "", "Open the following local HTTPS URLs after starting Compose. The desktop password is `VNC_PW` in `.env`.", ""])
+        readme.extend(["", "## GUI access", "", f"Open the following local HTTPS URLs after starting Compose. Sign in as `{GUI_USERNAME}`; the password is `VNC_PW` in `.env`.", ""])
         readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
         readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The GUI server also starts an HTTP service on container port 8000."])
     if has_router:
@@ -375,7 +384,10 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         readme.extend(["", "## Connectivity notes", ""])
         readme.extend(f"- {warning}" for warning in warnings)
     files["README.md"] = "\n".join(readme) + "\n"
-    files["topology.json"] = json.dumps({"nodes": nodes, "links": links}, ensure_ascii=False, indent=2) + "\n"
+    topology_snapshot = {"nodes": nodes, "links": links}
+    if gui_ports:
+        topology_snapshot["guiPassword"] = gui_password
+    files["topology.json"] = json.dumps(topology_snapshot, ensure_ascii=False, indent=2) + "\n"
     return files, warnings
 
 

@@ -6,6 +6,7 @@ const edgeLayer = $('#edges');
 const STORAGE_KEY = 'topology-lab-v1';
 const TOPOLOGY_FORMAT = 'topology-lab';
 const TOPOLOGY_VERSION = 1;
+const GUI_USERNAME = 'kasm_user';
 const TYPE_LABEL = { client: '客户端', router: '路由器', server: '服务器', switch: '交换机' };
 const TYPE_ICON = { client: '⌘', router: '◇', server: '▣', switch: '▦' };
 const NODE_W = 154, NODE_H = 100;
@@ -19,6 +20,17 @@ let generated = null;
 let activeFile = null;
 let toastTimer;
 
+function randomGuiPassword() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(18));
+  return Array.from(bytes, value => alphabet[value % alphabet.length]).join('');
+}
+function syncGuiPassword(document) {
+  if (document.nodes.some(node => node.gui)) {
+    if (typeof document.guiPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(document.guiPassword)) document.guiPassword = randomGuiPassword();
+  } else delete document.guiPassword;
+  return document;
+}
 function demoTopology() {
   return {
     nodes: [
@@ -35,13 +47,15 @@ function demoTopology() {
 function loadTopology() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (saved && Array.isArray(saved.nodes) && Array.isArray(saved.links)) return saved;
+    if (saved && Array.isArray(saved.nodes) && Array.isArray(saved.links)) return syncGuiPassword(saved);
   } catch (_) {}
-  return demoTopology();
+  return syncGuiPassword(demoTopology());
 }
-function save() { localStorage.setItem(STORAGE_KEY, JSON.stringify(topology)); generated = null; $('#fileTitle').textContent = activeFile ? `${activeFile} · 需刷新` : '选择文件查看内容'; }
+function save() { syncGuiPassword(topology); localStorage.setItem(STORAGE_KEY, JSON.stringify(topology)); generated = null; $('#fileTitle').textContent = activeFile ? `${activeFile} · 需刷新` : '选择文件查看内容'; }
 function topologyDocument() {
-  return {format: TOPOLOGY_FORMAT, version: TOPOLOGY_VERSION, savedAt: new Date().toISOString(), viewport: {...transform}, nodes: topology.nodes, links: topology.links};
+  const document = {format: TOPOLOGY_FORMAT, version: TOPOLOGY_VERSION, savedAt: new Date().toISOString(), viewport: {...transform}, nodes: topology.nodes, links: topology.links};
+  if (topology.guiPassword) document.guiPassword = topology.guiPassword;
+  return document;
 }
 function topologyFilename() {
   const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
@@ -87,9 +101,14 @@ function validateTopologyDocument(document) {
     linkIds.add(raw.id);
     return {id:raw.id, source:raw.source, target:raw.target, subnet:raw.subnet || '', sourceIp:raw.sourceIp || '', targetIp:raw.targetIp || '', sourceMac:raw.sourceMac || '', targetMac:raw.targetMac || ''};
   });
+  let guiPassword = document.guiPassword;
+  if (nodes.some(node => node.gui)) {
+    if (guiPassword === undefined) guiPassword = randomGuiPassword();
+    else if (typeof guiPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(guiPassword)) throw new Error('GUI 密码格式无效');
+  } else guiPassword = null;
   const view = document.viewport;
   const viewportState = view && [view.x, view.y, view.scale].every(value => Number.isFinite(Number(value))) ? {x:Number(view.x), y:Number(view.y), scale:Math.max(.45, Math.min(1.7, Number(view.scale)))} : null;
-  return {nodes, links, viewportState};
+  return {nodes, links, viewportState, guiPassword};
 }
 async function chooseTopologyFile() {
   if (typeof window.showOpenFilePicker === 'function') {
@@ -106,7 +125,7 @@ async function openTopologyFile() {
     const file = await chooseTopologyFile(); if (!file) return;
     if (file.size > 2_000_000) throw new Error('拓扑文件不能超过 2 MB');
     const parsed = validateTopologyDocument(JSON.parse(await file.text()));
-    topology = {nodes:parsed.nodes, links:parsed.links}; selection = null; stopConnecting(); save(); render();
+    topology = {nodes:parsed.nodes, links:parsed.links}; if (parsed.guiPassword) topology.guiPassword = parsed.guiPassword; selection = null; stopConnecting(); save(); render();
     if (parsed.viewportState) { transform = parsed.viewportState; renderTransform(); } else fitView();
     toast(`已打开拓扑：${file.name}`);
   } catch (error) { if (error.name !== 'AbortError') toast(`打开拓扑失败：${error.message}`); }
@@ -118,6 +137,7 @@ function worldPoint(clientX, clientY) { const rect = viewport.getBoundingClientR
 function renderTransform() { world.style.transform = `translate(${transform.x}px,${transform.y}px) scale(${transform.scale})`; $('#zoomLabel').textContent = `${Math.round(transform.scale * 100)}%`; }
 function nodeById(id) { return topology.nodes.find(n => n.id === id); }
 function degree(id) { return topology.links.filter(l => l.source === id || l.target === id).length; }
+function guiPort(id) { return 6901 + topology.nodes.filter(node => node.gui).findIndex(node => node.id === id); }
 function canConnect(id) { const n = nodeById(id); return n && (n.type === 'router' || n.type === 'switch' || degree(id) === 0); }
 function chooseSource(id) {
   if (!canConnect(id)) { toast('客户端和服务器只能连接一条线，请通过交换机连接多个设备'); return; }
@@ -312,10 +332,15 @@ function renderInspector() {
     const node = nodeById(selection.id);
     if (!node) { selection = null; renderInspector(); return; }
     const connected = topology.links.filter(l => l.source === node.id || l.target === node.id);
-    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机：同交换机网段的设备共享 Docker bridge，不需要配置 IP。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>使用 kasmweb/ubuntu-focal-desktop:1.16.0</small></span></label>`}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
+    const guiControls = node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机：同交换机网段的设备共享 Docker bridge，不需要配置 IP。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>使用 kasmweb/ubuntu-focal-desktop:1.16.0</small></span></label>${node.gui ? `<div class="gui-credentials"><div class="credential-title">GUI 登录信息</div><div class="credential-row"><span>地址</span><code>https://localhost:${guiPort(node.id)}</code></div><div class="credential-row"><span>用户名</span><code>${GUI_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.guiPassword)}</code></div><button type="button" data-copy-gui>复制登录信息</button><small>密码会同步写入生成项目的 .env。</small></div>` : ''}`;
+    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
     body.querySelector('[data-node-field="name"]').addEventListener('input', event => { node.name = event.target.value; save(); renderNodes(); });
     body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; save(); render(); });
-    body.querySelector('[data-node-field="gui"]')?.addEventListener('change', event => { node.gui = event.target.checked; save(); renderNodes(); });
+    body.querySelector('[data-node-field="gui"]')?.addEventListener('change', event => { node.gui = event.target.checked; save(); render(); if (node.gui) toast('GUI 登录用户名和密码已显示在属性面板'); });
+    body.querySelector('[data-copy-gui]')?.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(`地址：https://localhost:${guiPort(node.id)}\n用户名：${GUI_USERNAME}\n密码：${topology.guiPassword}`); toast('GUI 登录信息已复制'); }
+      catch (error) { toast(`复制失败：${error.message}`); }
+    });
     return;
   }
   const link = topology.links.find(l => l.id === selection.id);

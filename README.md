@@ -109,7 +109,7 @@
 
   ## GUI 桌面节点
 
-  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。生成项目会为每个 GUI 节点从本机 `6901` 端口起分配不同的映射端口，并在 `.env` 中设置随机桌面密码。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器仍会在容器内 8000 端口提供 HTTP 服务。
+  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器仍会在容器内 8000 端口提供 HTTP 服务。
 
   ## 安全与注意事项
 

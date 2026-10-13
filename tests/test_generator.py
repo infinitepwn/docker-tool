@@ -1,5 +1,6 @@
 import unittest
 import io
+import json
 import zipfile
 
 from app import OPENWRT_BUNDLE_PATH, TopologyError, build_files, make_archive, route_commands
@@ -72,6 +73,7 @@ class GeneratorTests(unittest.TestCase):
         data = topology()
         data["nodes"][0]["gui"] = True
         data["nodes"][3]["gui"] = True
+        data["guiPassword"] = "DesktopPass1234"
         files, _ = build_files(data)
         compose = files["compose.yaml"]
         self.assertIn("FROM scratch", files["dockerfiles/router-1.Dockerfile"])
@@ -81,7 +83,9 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn('127.0.0.1:6901:6901', compose)
         self.assertIn('127.0.0.1:6902:6901', compose)
         self.assertIn('post_start:', compose)
-        self.assertIn('VNC_PW=', files['.env'])
+        self.assertEqual(files['.env'], 'VNC_PW=DesktopPass1234\n')
+        self.assertIn('Sign in as `kasm_user`', files['README.md'])
+        self.assertEqual(json.loads(files['topology.json'])['guiPassword'], 'DesktopPass1234')
         archive = zipfile.ZipFile(io.BytesIO(make_archive(files, True)))
         self.assertIn(OPENWRT_BUNDLE_PATH, archive.namelist())
         self.assertEqual(archive.read(OPENWRT_BUNDLE_PATH)[:2], b'\x1f\x8b')
@@ -90,6 +94,13 @@ class GeneratorTests(unittest.TestCase):
         data = topology()
         data["nodes"][1]["gui"] = True
         with self.assertRaisesRegex(TopologyError, "GUI 配置无效"):
+            build_files(data)
+
+    def test_rejects_invalid_gui_password(self):
+        data = topology()
+        data["nodes"][0]["gui"] = True
+        data["guiPassword"] = "short"
+        with self.assertRaisesRegex(TopologyError, "GUI 密码"):
             build_files(data)
 
 
