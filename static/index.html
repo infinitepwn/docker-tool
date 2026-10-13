@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>拓扑工坊 · Docker 网络实验室</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">⬡</div><div><strong>拓扑工坊</strong><span>DOCKER NETWORK LAB</span></div></div>
+      <div class="sidebar-section">
+        <div class="section-heading">组件库 <span>拖入画布或点击添加</span></div>
+        <button class="palette-item" data-add="client" draggable="true"><span class="palette-icon client">⌘</span><span><strong>客户端</strong><small>Client · 测试终端</small></span><span class="palette-plus">＋</span></button>
+        <button class="palette-item" data-add="router" draggable="true"><span class="palette-icon router">◇</span><span><strong>路由器</strong><small>Router · 网络转发</small></span><span class="palette-plus">＋</span></button>
+        <button class="palette-item" data-add="server" draggable="true"><span class="palette-icon server">▣</span><span><strong>服务器</strong><small>Server · HTTP 服务</small></span><span class="palette-plus">＋</span></button>
+      </div>
+      <div class="sidebar-section guide">
+        <div class="section-heading">快速上手</div>
+        <div class="guide-step"><b>01</b><span>添加节点并拖动布局</span></div>
+        <div class="guide-step"><b>02</b><span>点击节点连接点，再点击目标节点</span></div>
+        <div class="guide-step"><b>03</b><span>选中连线设置网段、IP 和 MAC</span></div>
+        <div class="guide-step"><b>04</b><span>预览配置并下载 Docker 项目</span></div>
+      </div>
+      <div class="sidebar-bottom"><span class="status-dot"></span> 本地运行 · 自动保存</div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="heading"><span class="eyebrow">WORKSPACE / NETWORK TOPOLOGY</span><h1>网络拓扑设计器</h1><p>画出网络结构，生成可运行的 Docker Compose 项目。</p></div>
+        <div class="top-actions"><button class="quiet-button" id="sampleBtn">加载示例</button><button class="quiet-button" id="clearBtn">清空画布</button><button class="primary-button" id="downloadBtn"><span>↓</span> 下载项目 ZIP</button></div>
+      </header>
+
+      <div class="workspace">
+        <section class="canvas-panel">
+          <div class="canvas-toolbar"><div class="canvas-label"><span class="live-dot"></span> 拓扑画布 <span class="canvas-count" id="counts"></span></div><div class="canvas-tools"><button id="connectBtn" title="连接节点">◇ <span>连接节点</span></button><span class="tool-separator"></span><button id="zoomOut" title="缩小">−</button><span id="zoomLabel">100%</span><button id="zoomIn" title="放大">＋</button><button id="fitBtn" title="居中">⊙</button></div></div>
+          <div class="canvas-viewport" id="viewport"><div class="canvas-world" id="world"><svg class="edge-layer" id="edges" width="2400" height="1600" viewBox="0 0 2400 1600"></svg><div class="node-layer" id="nodes"></div></div><div class="canvas-hint" id="canvasHint">拖动节点布局 · 点击节点侧边的连接点创建连线</div></div>
+          <div class="canvas-footer"><span><i class="legend-dot client"></i>客户端</span><span><i class="legend-dot router"></i>路由器</span><span><i class="legend-dot server"></i>服务器</span><span class="footer-right">每条连线对应独立 Docker bridge 网络</span></div>
+        </section>
+
+        <aside class="inspector"><div class="inspector-title"><span>属性面板</span><button id="deleteBtn" class="icon-button danger" title="删除所选元素" disabled>⌫</button></div><div id="inspectorBody"></div></aside>
+      </div>
+
+      <section class="output-panel"><div class="output-header"><div><span class="eyebrow">GENERATED OUTPUT</span><h2>生成预览</h2><p>拓扑变化后点击刷新预览，检查即将下载的文件。</p></div><button class="secondary-button" id="previewBtn">↻ 刷新预览</button></div><div class="output-content"><div class="file-list" id="fileList"><div class="empty-file">尚未生成文件</div></div><div class="code-pane"><div class="code-title"><span id="fileTitle">选择文件查看内容</span><button id="copyBtn" title="复制内容" disabled>复制</button></div><pre id="codeContent">添加节点与连线后，点击“刷新预览”。</pre></div></div><div class="warning-list" id="warnings"></div></section>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
