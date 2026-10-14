@@ -33,6 +33,7 @@ class GeneratorTests(unittest.TestCase):
         self.assertFalse(warnings)
         self.assertIn("net.ipv4.ip_forward", files["compose.yaml"])
         self.assertIn("mac_address: 02:42:c8:00:01:01", files["compose.yaml"])
+        self.assertEqual(files["compose.yaml"].count('com.docker.network.bridge.enable_ip_masquerade: "false"'), 3)
         self.assertIn("dockerfiles/client-1.Dockerfile", files)
 
     def test_rejects_overlapping_networks(self):

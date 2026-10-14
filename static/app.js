@@ -463,7 +463,7 @@ async function saveLocal() {
       catch (error) { throw new Error(`写入中断（已完成 ${written}/${entries.length}）：${entry.path}：${error.message}`); }
     }
     toast(`已向“${directory.name}”写入 ${entries.length} 个文件`);
-    alert(`项目已生成到文件夹“${directory.name}”。\n\n在该目录运行：docker compose up -d --build --force-recreate`);
+    alert(`项目已生成到文件夹“${directory.name}”。\n\n在该目录运行：\ndocker compose down\ndocker compose up -d --build`);
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
 }

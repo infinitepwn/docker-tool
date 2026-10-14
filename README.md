@@ -40,9 +40,12 @@
 
   ```
   cd "$HOME/Documents/Cybersecurity-lab/lab3"
-  docker compose up -d --build --force-recreate
+  docker compose down
+  docker compose up -d --build
   docker compose ps
   ```
+
+  `driver_opts` 等网络配置不能原地修改，因此更新已有实验目录后需要先执行 `docker compose down`，再重新启动，让 Docker 重建网络。
 
   如需确保完全重新构建镜像，可运行：
 
@@ -95,6 +98,7 @@
   - **直接连接：**未通过交换机的旧式设备直连链路，仍可各自对应独立 Docker bridge 网络；客户端和服务器最多接入一个网络，路由器可以接入多个网络。
   - **IP 与网关：**在每个 bridge 子网中，Docker 网关会占用首个可用主机地址（如 `192.168.2.1`），节点需使用其余可用地址。同网段设备可以直接通信；不同网段间需要路由。
   - **静态路由：**生成器为需要的设备配置非直连网段的静态路由，路由器启用 IPv4 转发。只有可通过路由器到达的网段才会生成有效路由；不可达情况会在预览和生成项目的 README 中提示。
+  - **关闭 IP 伪装：**所有生成的 Docker bridge 网络都会设置 `com.docker.network.bridge.enable_ip_masquerade: "false"`。容器流量离开 bridge 时保留原始源 IP；如需访问外部网络，外部设备必须具备返回该实验网段的路由。
   - **配置校验：**生成时会检查 IP、MAC、网段冲突及节点连接数等问题。
 
   ## OpenWrt 路由器

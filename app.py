@@ -352,6 +352,8 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         lines.extend([
             f"  net_{segment['key']}:",
             "    driver: bridge",
+            "    driver_opts:",
+            "      com.docker.network.bridge.enable_ip_masquerade: \"false\"",
             "    ipam:",
             "      config:",
             f"        - subnet: {segment['subnet']}",
@@ -359,12 +361,12 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     files["compose.yaml"] = "\n".join(lines) + "\n"
     if gui_ports:
         files[".env"] = f"VNC_PW={gui_password}\n"
-    readme = ["# Generated topology", "", "Run `docker compose up --build -d` in this directory.", "Use `docker compose ps` to inspect containers and `docker compose down` to stop them.", "", "## Nodes", ""]
+    readme = ["# Generated topology", "", "Run `docker compose up --build -d` in this directory.", "When replacing an existing generated topology, run `docker compose down` first so Docker recreates the networks with the current driver options.", "Use `docker compose ps` to inspect containers and `docker compose down` to stop them.", "", "## Nodes", ""]
     for node in nodes:
         suffix = "，GUI" if node["gui"] else ""
         detail = "（Docker bridge 虚拟二层交换机，不创建容器）" if node["type"] == "switch" else ""
         readme.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix}){detail}" + (f"; container=`{node_container_name(node)}`, hostname=`{node_hostname(node)}`" if node["type"] != "switch" else ""))
-    readme.extend(["", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
+    readme.extend(["", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
     for segment in segments:
         participants = ", ".join(f"{node_id}={iface['ip']}" for node_id, iface in segment["members"].items())
         readme.append(f"- `net_{segment['key']}` `{segment['subnet']}`: {participants}")
