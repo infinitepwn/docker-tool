@@ -253,7 +253,11 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                 "ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
                 "LABEL topology.role=router\n")
     if gui:
-        packages = "sudo apache2 openssh-server vsftpd" if kind == "server" else "sudo"
+        packages = ("sudo ca-certificates procps iproute2 iputils-ping dnsutils traceroute curl wget "
+                    "tcpdump net-tools hping3 nmap openssh-client inetutils-telnet inetutils-ftp "
+                    "less nano vim")
+        if kind == "server":
+            packages += " apache2 openssh-server vsftpd busybox-static"
         install_steps = [
             "apt-get update",
             f"apt-get install -y --no-install-recommends {packages}",
@@ -271,7 +275,7 @@ def dockerfile(kind: str, gui: bool = False) -> str:
             ])
         install_steps.append("rm -rf /var/lib/apt/lists/*")
         install_command = " \\\n    && ".join(install_steps)
-        expose = "EXPOSE 21 22 80 30000-30009\n" if kind == "server" else ""
+        expose = "EXPOSE 21 22 23 80 30000-30009\n" if kind == "server" else ""
         return (f"FROM {GUI_IMAGE}\n"
                 "USER root\n"
                 f"RUN {install_command}\n"
@@ -280,9 +284,10 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                 f"LABEL topology.role={kind}\n")
     packages = ("bash bash-completion ca-certificates coreutils findutils grep sed less nano vim "
                 "procps util-linux iproute2 iputils-ping dnsutils traceroute "
-                "curl wget tcpdump net-tools hping3 nmap python3 python3-scapy")
+                "curl wget tcpdump net-tools hping3 nmap openssh-client inetutils-telnet "
+                "inetutils-ftp python3 python3-scapy")
     if kind == "server":
-        packages += " apache2 openssh-server vsftpd"
+        packages += " apache2 openssh-server vsftpd busybox-static"
     server_setup = (
         f"RUN (id -u {SERVER_USERNAME} >/dev/null 2>&1 || useradd -m -s /bin/bash {SERVER_USERNAME}) "
         "&& mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d "
@@ -290,7 +295,7 @@ def dockerfile(kind: str, gui: bool = False) -> str:
         "&& printf '%s\\n' 'listen=YES' 'listen_ipv6=NO' 'background=YES' 'anonymous_enable=NO' 'local_enable=YES' 'write_enable=YES' 'local_umask=022' 'chroot_local_user=YES' 'allow_writeable_chroot=YES' 'pam_service_name=vsftpd' 'secure_chroot_dir=/var/run/vsftpd/empty' 'pasv_enable=YES' 'pasv_min_port=30000' 'pasv_max_port=30009' 'seccomp_sandbox=NO' > /etc/vsftpd.conf "
         "&& printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf "
         "&& a2enconf topology-server-name\n"
-        "EXPOSE 21 22 80 30000-30009\n" if kind == "server" else "")
+        "EXPOSE 21 22 23 80 30000-30009\n" if kind == "server" else "")
     return ("FROM ubuntu:24.04\n"
             "ENV DEBIAN_FRONTEND=noninteractive\n"
             f"RUN apt-get update && apt-get install -y --no-install-recommends {packages} "
@@ -391,6 +396,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
                 "ssh-keygen -A",
                 "/usr/sbin/sshd",
                 "/usr/sbin/vsftpd /etc/vsftpd.conf",
+                "/bin/busybox telnetd -p 23 -l /bin/login",
             ])
         if gui:
             hook = startup + (["apache2ctl start"] if kind == "server" else [])
@@ -434,7 +440,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         suffix = "，GUI" if node["gui"] else ""
         detail = "（Docker bridge 虚拟二层交换机，不创建容器）" if node["type"] == "switch" else ""
         readme.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix}){detail}" + (f"; container=`{node_container_name(node)}`, hostname=`{node_hostname(node)}`" if node["type"] != "switch" else ""))
-    readme.extend(["", "Every physical node container runs with `privileged: true`, allowing full container capabilities and device access for lab modifications. Switch nodes are Docker bridges and do not create containers.", "Changes made only inside a running container are lost when that container is rebuilt; put persistent changes in its Dockerfile or a mounted volume.", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "Every server node runs Apache HTTP Server on container port 80; access it from the topology with `http://<server-ip>/`. Apache's document root is `/var/www/html`.", "Every server also runs OpenSSH on port 22 and vsftpd on port 21. Sign in as `lab` with `SERVER_PASSWORD` from `.env`. FTP passive mode uses ports 30000–30009 inside the topology network.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
+    readme.extend(["", "Every physical node container runs with `privileged: true`, allowing full container capabilities and device access for lab modifications. Switch nodes are Docker bridges and do not create containers.", "Changes made only inside a running container are lost when that container is rebuilt; put persistent changes in its Dockerfile or a mounted volume.", "Client/server images include Bash and common Linux tools such as ping, SSH, Telnet and FTP clients; interactive Bash displays `root@hostname:~#`. Enter non-GUI containers with `docker exec -it <container-name> bash`.", "Every server node runs Apache HTTP Server on container port 80; access it from the topology with `http://<server-ip>/`. Apache's document root is `/var/www/html`.", "Every server also runs OpenSSH on port 22, BusyBox Telnet on port 23 and vsftpd on port 21. Sign in as `lab` with `SERVER_PASSWORD` from `.env`. FTP passive mode uses ports 30000–30009 inside the topology network.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
     for segment in segments:
         participants = ", ".join(f"{node_id}={iface['ip']}" for node_id, iface in segment["members"].items())
         readme.append(f"- `net_{segment['key']}` `{segment['subnet']}`: {participants}")
@@ -447,9 +453,9 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     if gui_ports:
         readme.extend(["", "## GUI access", "", f"Open the following local HTTPS URLs after starting Compose. Sign in as `{GUI_USERNAME}`; the password is `VNC_PW` in `.env`.", ""])
         readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
-        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also runs Apache on container port 80."])
+        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "They include ping, ip, curl, wget, SSH, Telnet, FTP, traceroute, tcpdump, nmap and common terminal editors.", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also runs Apache, OpenSSH, Telnet and vsftpd."])
     if server_nodes:
-        readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
+        readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- Telnet: `telnet <server-ip> 23`", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     if warnings:
