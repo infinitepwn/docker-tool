@@ -34,9 +34,13 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("net.ipv4.ip_forward", files["compose.yaml"])
         self.assertIn("mac_address: 02:42:c8:00:01:01", files["compose.yaml"])
         self.assertEqual(files["compose.yaml"].count('com.docker.network.bridge.enable_ip_masquerade: "false"'), 3)
-        self.assertIn("python3 -m http.server 80 --bind 0.0.0.0", files["compose.yaml"])
-        self.assertNotIn("http.server 8000", files["compose.yaml"])
-        self.assertIn("HTTP service on container port 80", files["README.md"])
+        server_dockerfile = files["dockerfiles/server-1.Dockerfile"]
+        self.assertIn("apache2", server_dockerfile)
+        self.assertIn("ServerName localhost", server_dockerfile)
+        self.assertIn("EXPOSE 80", server_dockerfile)
+        self.assertIn("exec apache2ctl -D FOREGROUND", files["compose.yaml"])
+        self.assertNotIn("python3 -m http.server", files["compose.yaml"])
+        self.assertIn("Apache HTTP Server on container port 80", files["README.md"])
         self.assertIn("dockerfiles/client-1.Dockerfile", files)
 
     def test_rejects_overlapping_networks(self):
@@ -91,8 +95,12 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn('127.0.0.1:6901:6901', compose)
         self.assertIn('127.0.0.1:6902:6901', compose)
         self.assertIn('post_start:', compose)
-        self.assertIn('nohup python3 -m http.server 80 --bind 0.0.0.0', compose)
-        self.assertNotIn('http.server 8000', compose)
+        gui_server_dockerfile = files["dockerfiles/server-1.Dockerfile"]
+        self.assertIn('apt-get install -y --no-install-recommends sudo apache2', gui_server_dockerfile)
+        self.assertIn('ServerName localhost', gui_server_dockerfile)
+        self.assertIn('EXPOSE 80', gui_server_dockerfile)
+        self.assertIn('apache2ctl start', compose)
+        self.assertNotIn('python3 -m http.server', compose)
         self.assertEqual(files['.env'], 'VNC_PW=DesktopPass1234\n')
         self.assertIn('Sign in as `kasm_user`', files['README.md'])
         self.assertIn('Run `sudo -i`', files['README.md'])

@@ -75,7 +75,7 @@
   curl http://192.168.2.11
   ```
 
-  以上节点名和 IP 只是示例，应按当前拓扑修改。服务器默认在容器的 80 端口提供 HTTP 服务。
+  以上节点名和 IP 只是示例，应按当前拓扑修改。服务器默认使用 Apache HTTP Server，在容器的 80 端口提供服务，网站目录为 `/var/www/html`。
 
   ## 容器名称与交互式 Bash
 
@@ -113,7 +113,7 @@
 
   ## GUI 桌面节点
 
-  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。网页登录名是 `kasm_user`，桌面内的 Linux 账户是 `kasm-user`；在桌面终端执行 `sudo -i` 即可免密进入容器内 root。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器仍会在容器内 80 端口提供 HTTP 服务。
+  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。网页登录名是 `kasm_user`，桌面内的 Linux 账户是 `kasm-user`；在桌面终端执行 `sudo -i` 即可免密进入容器内 root。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器同样使用 Apache，并在容器内 80 端口提供 HTTP 服务。
 
   ## 安全与注意事项
 
