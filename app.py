@@ -336,7 +336,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"1\""])
         startup = list(commands[node_id])
         if gui:
-            hook = startup + (["(nohup python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/topology-http.log 2>&1 </dev/null &)"] if kind == "server" else [])
+            hook = startup + (["(nohup python3 -m http.server 80 --bind 0.0.0.0 >/tmp/topology-http.log 2>&1 </dev/null &)"] if kind == "server" else [])
             if hook:
                 lines.extend([
                     "    post_start:",
@@ -344,7 +344,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
                     "        user: root",
                 ])
         else:
-            startup += ["python3 -m http.server 8000 --bind 0.0.0.0"] if kind == "server" else ["tail -f /dev/null"]
+            startup += ["python3 -m http.server 80 --bind 0.0.0.0"] if kind == "server" else ["tail -f /dev/null"]
             lines.append(f"    command: [\"sh\", \"-c\", {yaml_string(' && '.join(startup))}]")
         lines.append("    networks:")
         for key, interface in attachments[node_id]:
@@ -372,7 +372,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         suffix = "，GUI" if node["gui"] else ""
         detail = "（Docker bridge 虚拟二层交换机，不创建容器）" if node["type"] == "switch" else ""
         readme.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix}){detail}" + (f"; container=`{node_container_name(node)}`, hostname=`{node_hostname(node)}`" if node["type"] != "switch" else ""))
-    readme.extend(["", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
+    readme.extend(["", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "Every server node starts an HTTP service on container port 80; access it from the topology with `http://<server-ip>/`.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
     for segment in segments:
         participants = ", ".join(f"{node_id}={iface['ip']}" for node_id, iface in segment["members"].items())
         readme.append(f"- `net_{segment['key']}` `{segment['subnet']}`: {participants}")
@@ -385,7 +385,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     if gui_ports:
         readme.extend(["", "## GUI access", "", f"Open the following local HTTPS URLs after starting Compose. Sign in as `{GUI_USERNAME}`; the password is `VNC_PW` in `.env`.", ""])
         readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
-        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also starts an HTTP service on container port 8000."])
+        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also starts an HTTP service on container port 80."])
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     if warnings:
