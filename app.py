@@ -250,6 +250,12 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                 "LABEL topology.role=router\n")
     if gui:
         return (f"FROM {GUI_IMAGE}\n"
+                "USER root\n"
+                "RUN apt-get update && apt-get install -y --no-install-recommends sudo \\\n"
+                "    && printf '%s\\n' 'kasm-user ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/kasm-user \\\n"
+                "    && chmod 0440 /etc/sudoers.d/kasm-user \\\n"
+                "    && rm -rf /var/lib/apt/lists/*\n"
+                "USER 1000\n"
                 f"LABEL topology.role={kind}\n")
     return ("FROM ubuntu:24.04\n"
             "ENV DEBIAN_FRONTEND=noninteractive\n"
@@ -379,7 +385,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     if gui_ports:
         readme.extend(["", "## GUI access", "", f"Open the following local HTTPS URLs after starting Compose. Sign in as `{GUI_USERNAME}`; the password is `VNC_PW` in `.env`.", ""])
         readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
-        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The GUI server also starts an HTTP service on container port 8000."])
+        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also starts an HTTP service on container port 8000."])
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     if warnings:
