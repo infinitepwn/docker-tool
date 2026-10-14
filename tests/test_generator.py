@@ -33,6 +33,8 @@ class GeneratorTests(unittest.TestCase):
         self.assertFalse(warnings)
         self.assertIn("net.ipv4.ip_forward", files["compose.yaml"])
         self.assertIn("mac_address: 02:42:c8:00:01:01", files["compose.yaml"])
+        self.assertEqual(files["compose.yaml"].count("    privileged: true"), 4)
+        self.assertNotIn("cap_add:", files["compose.yaml"])
         self.assertEqual(files["compose.yaml"].count('com.docker.network.bridge.enable_ip_masquerade: "false"'), 3)
         server_dockerfile = files["dockerfiles/server-1.Dockerfile"]
         self.assertIn("apache2", server_dockerfile)
@@ -41,6 +43,7 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("exec apache2ctl -D FOREGROUND", files["compose.yaml"])
         self.assertNotIn("python3 -m http.server", files["compose.yaml"])
         self.assertIn("Apache HTTP Server on container port 80", files["README.md"])
+        self.assertIn("Every physical node container runs with `privileged: true`", files["README.md"])
         self.assertIn("dockerfiles/client-1.Dockerfile", files)
 
     def test_rejects_overlapping_networks(self):
@@ -94,6 +97,7 @@ class GeneratorTests(unittest.TestCase):
         self.assertLess(gui_dockerfile.index("USER root"), gui_dockerfile.index("USER 1000"))
         self.assertIn('127.0.0.1:6901:6901', compose)
         self.assertIn('127.0.0.1:6902:6901', compose)
+        self.assertEqual(compose.count('    privileged: true'), 4)
         self.assertIn('post_start:', compose)
         gui_server_dockerfile = files["dockerfiles/server-1.Dockerfile"]
         self.assertIn('apt-get install -y --no-install-recommends sudo apache2', gui_server_dockerfile)
