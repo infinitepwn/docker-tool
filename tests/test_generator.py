@@ -8,6 +8,8 @@ from app import OPENWRT_BUNDLE_PATH, TopologyError, build_files, make_archive, r
 
 def topology():
     return {
+        "projectName": "topology-lab-test1234",
+        "serverPassword": "ServerPass1234",
         "nodes": [
             {"id": "client-1", "name": "客户端 A", "type": "client"},
             {"id": "router-1", "name": "路由 1", "type": "router"},
@@ -32,17 +34,32 @@ class GeneratorTests(unittest.TestCase):
         files, warnings = build_files(data)
         self.assertFalse(warnings)
         self.assertIn("net.ipv4.ip_forward", files["compose.yaml"])
+        self.assertTrue(files["compose.yaml"].startswith("name: topology-lab-test1234\n"))
         self.assertIn("mac_address: 02:42:c8:00:01:01", files["compose.yaml"])
         self.assertEqual(files["compose.yaml"].count("    privileged: true"), 4)
         self.assertNotIn("cap_add:", files["compose.yaml"])
         self.assertEqual(files["compose.yaml"].count('com.docker.network.bridge.enable_ip_masquerade: "false"'), 3)
         server_dockerfile = files["dockerfiles/server-1.Dockerfile"]
         self.assertIn("apache2", server_dockerfile)
+        self.assertIn("openssh-server", server_dockerfile)
+        self.assertIn("vsftpd", server_dockerfile)
+        self.assertIn("useradd -m -s /bin/bash lab", server_dockerfile)
+        self.assertIn("PasswordAuthentication yes", server_dockerfile)
+        self.assertIn("pasv_min_port=30000", server_dockerfile)
         self.assertIn("ServerName localhost", server_dockerfile)
-        self.assertIn("EXPOSE 80", server_dockerfile)
+        self.assertIn("EXPOSE 21 22 80 30000-30009", server_dockerfile)
+        self.assertIn("SERVER_PASSWORD: ${SERVER_PASSWORD}", files["compose.yaml"])
+        self.assertIn("ssh-keygen -A", files["compose.yaml"])
+        self.assertIn("/usr/sbin/sshd", files["compose.yaml"])
+        self.assertIn("/usr/sbin/vsftpd /etc/vsftpd.conf", files["compose.yaml"])
+        self.assertIn("$${SERVER_PASSWORD}", files["compose.yaml"])
         self.assertIn("exec apache2ctl -D FOREGROUND", files["compose.yaml"])
         self.assertNotIn("python3 -m http.server", files["compose.yaml"])
         self.assertIn("Apache HTTP Server on container port 80", files["README.md"])
+        self.assertIn("OpenSSH on port 22 and vsftpd on port 21", files["README.md"])
+        self.assertEqual(files[".env"], "SERVER_PASSWORD=ServerPass1234\n")
+        self.assertEqual(json.loads(files["topology.json"])["serverPassword"], "ServerPass1234")
+        self.assertEqual(json.loads(files["topology.json"])["projectName"], "topology-lab-test1234")
         self.assertIn("Every physical node container runs with `privileged: true`", files["README.md"])
         self.assertIn("dockerfiles/client-1.Dockerfile", files)
 
@@ -100,15 +117,20 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(compose.count('    privileged: true'), 4)
         self.assertIn('post_start:', compose)
         gui_server_dockerfile = files["dockerfiles/server-1.Dockerfile"]
-        self.assertIn('apt-get install -y --no-install-recommends sudo apache2', gui_server_dockerfile)
+        self.assertIn('apt-get install -y --no-install-recommends sudo apache2 openssh-server vsftpd', gui_server_dockerfile)
         self.assertIn('ServerName localhost', gui_server_dockerfile)
-        self.assertIn('EXPOSE 80', gui_server_dockerfile)
+        self.assertIn('EXPOSE 21 22 80 30000-30009', gui_server_dockerfile)
+        self.assertIn('PasswordAuthentication yes', gui_server_dockerfile)
+        self.assertIn('pasv_max_port=30009', gui_server_dockerfile)
         self.assertIn('apache2ctl start', compose)
+        self.assertIn('/usr/sbin/sshd', compose)
+        self.assertIn('/usr/sbin/vsftpd /etc/vsftpd.conf', compose)
         self.assertNotIn('python3 -m http.server', compose)
-        self.assertEqual(files['.env'], 'VNC_PW=DesktopPass1234\n')
+        self.assertEqual(files['.env'], 'VNC_PW=DesktopPass1234\nSERVER_PASSWORD=ServerPass1234\n')
         self.assertIn('Sign in as `kasm_user`', files['README.md'])
         self.assertIn('Run `sudo -i`', files['README.md'])
         self.assertEqual(json.loads(files['topology.json'])['guiPassword'], 'DesktopPass1234')
+        self.assertEqual(json.loads(files['topology.json'])['serverPassword'], 'ServerPass1234')
         archive = zipfile.ZipFile(io.BytesIO(make_archive(files, True)))
         self.assertIn(OPENWRT_BUNDLE_PATH, archive.namelist())
         self.assertEqual(archive.read(OPENWRT_BUNDLE_PATH)[:2], b'\x1f\x8b')
@@ -124,6 +146,12 @@ class GeneratorTests(unittest.TestCase):
         data["nodes"][0]["gui"] = True
         data["guiPassword"] = "short"
         with self.assertRaisesRegex(TopologyError, "GUI 密码"):
+            build_files(data)
+
+    def test_rejects_invalid_server_password(self):
+        data = topology()
+        data["serverPassword"] = "short"
+        with self.assertRaisesRegex(TopologyError, "服务器密码"):
             build_files(data)
 
 

@@ -7,6 +7,7 @@ const STORAGE_KEY = 'topology-lab-v1';
 const TOPOLOGY_FORMAT = 'topology-lab';
 const TOPOLOGY_VERSION = 1;
 const GUI_USERNAME = 'kasm_user';
+const SERVER_USERNAME = 'lab';
 const TYPE_LABEL = { client: '客户端', router: '路由器', server: '服务器', switch: '交换机' };
 const TYPE_ICON = { client: '⌘', router: '◇', server: '▣', switch: '▦' };
 const NODE_W = 154, NODE_H = 100;
@@ -20,15 +21,23 @@ let generated = null;
 let activeFile = null;
 let toastTimer;
 
-function randomGuiPassword() {
+function randomPassword() {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
   const bytes = crypto.getRandomValues(new Uint8Array(18));
   return Array.from(bytes, value => alphabet[value % alphabet.length]).join('');
 }
-function syncGuiPassword(document) {
+function randomProjectName() {
+  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  return `topology-lab-${Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')}`;
+}
+function syncPasswords(document) {
+  if (typeof document.projectName !== 'string' || !/^topology-lab-[a-z0-9]{8,24}$/.test(document.projectName)) document.projectName = randomProjectName();
   if (document.nodes.some(node => node.gui)) {
-    if (typeof document.guiPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(document.guiPassword)) document.guiPassword = randomGuiPassword();
+    if (typeof document.guiPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(document.guiPassword)) document.guiPassword = randomPassword();
   } else delete document.guiPassword;
+  if (document.nodes.some(node => node.type === 'server')) {
+    if (typeof document.serverPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(document.serverPassword)) document.serverPassword = randomPassword();
+  } else delete document.serverPassword;
   return document;
 }
 function demoTopology() {
@@ -47,14 +56,15 @@ function demoTopology() {
 function loadTopology() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (saved && Array.isArray(saved.nodes) && Array.isArray(saved.links)) return syncGuiPassword(saved);
+    if (saved && Array.isArray(saved.nodes) && Array.isArray(saved.links)) return syncPasswords(saved);
   } catch (_) {}
-  return syncGuiPassword(demoTopology());
+  return syncPasswords(demoTopology());
 }
-function save() { syncGuiPassword(topology); localStorage.setItem(STORAGE_KEY, JSON.stringify(topology)); generated = null; $('#fileTitle').textContent = activeFile ? `${activeFile} · 需刷新` : '选择文件查看内容'; }
+function save() { syncPasswords(topology); localStorage.setItem(STORAGE_KEY, JSON.stringify(topology)); generated = null; $('#fileTitle').textContent = activeFile ? `${activeFile} · 需刷新` : '选择文件查看内容'; }
 function topologyDocument() {
-  const document = {format: TOPOLOGY_FORMAT, version: TOPOLOGY_VERSION, savedAt: new Date().toISOString(), viewport: {...transform}, nodes: topology.nodes, links: topology.links};
+  const document = {format: TOPOLOGY_FORMAT, version: TOPOLOGY_VERSION, savedAt: new Date().toISOString(), projectName: topology.projectName, viewport: {...transform}, nodes: topology.nodes, links: topology.links};
   if (topology.guiPassword) document.guiPassword = topology.guiPassword;
+  if (topology.serverPassword) document.serverPassword = topology.serverPassword;
   return document;
 }
 function topologyFilename() {
@@ -83,6 +93,8 @@ function validateTopologyDocument(document) {
   if (document.format && document.format !== TOPOLOGY_FORMAT) throw new Error('这不是拓扑工坊文件');
   if (document.version !== undefined && document.version !== TOPOLOGY_VERSION) throw new Error(`不支持的拓扑文件版本：${document.version}`);
   if (!Array.isArray(document.nodes) || !Array.isArray(document.links)) throw new Error('拓扑文件缺少 nodes 或 links');
+  const projectName = document.projectName === undefined ? randomProjectName() : document.projectName;
+  if (typeof projectName !== 'string' || !/^topology-lab-[a-z0-9]{8,24}$/.test(projectName)) throw new Error('项目标识无效');
   if (document.nodes.length > 80 || document.links.length > 160) throw new Error('拓扑规模超过限制');
   const ids = new Set();
   const nodes = document.nodes.map((raw, index) => {
@@ -103,12 +115,17 @@ function validateTopologyDocument(document) {
   });
   let guiPassword = document.guiPassword;
   if (nodes.some(node => node.gui)) {
-    if (guiPassword === undefined) guiPassword = randomGuiPassword();
+    if (guiPassword === undefined) guiPassword = randomPassword();
     else if (typeof guiPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(guiPassword)) throw new Error('GUI 密码格式无效');
   } else guiPassword = null;
+  let serverPassword = document.serverPassword;
+  if (nodes.some(node => node.type === 'server')) {
+    if (serverPassword === undefined) serverPassword = randomPassword();
+    else if (typeof serverPassword !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(serverPassword)) throw new Error('服务器密码格式无效');
+  } else serverPassword = null;
   const view = document.viewport;
   const viewportState = view && [view.x, view.y, view.scale].every(value => Number.isFinite(Number(value))) ? {x:Number(view.x), y:Number(view.y), scale:Math.max(.45, Math.min(1.7, Number(view.scale)))} : null;
-  return {nodes, links, viewportState, guiPassword};
+  return {nodes, links, viewportState, projectName, guiPassword, serverPassword};
 }
 async function chooseTopologyFile() {
   if (typeof window.showOpenFilePicker === 'function') {
@@ -125,7 +142,10 @@ async function openTopologyFile() {
     const file = await chooseTopologyFile(); if (!file) return;
     if (file.size > 2_000_000) throw new Error('拓扑文件不能超过 2 MB');
     const parsed = validateTopologyDocument(JSON.parse(await file.text()));
-    topology = {nodes:parsed.nodes, links:parsed.links}; if (parsed.guiPassword) topology.guiPassword = parsed.guiPassword; selection = null; stopConnecting(); save(); render();
+    topology = {projectName:parsed.projectName, nodes:parsed.nodes, links:parsed.links};
+    if (parsed.guiPassword) topology.guiPassword = parsed.guiPassword;
+    if (parsed.serverPassword) topology.serverPassword = parsed.serverPassword;
+    selection = null; stopConnecting(); save(); render();
     if (parsed.viewportState) { transform = parsed.viewportState; renderTransform(); } else fitView();
     toast(`已打开拓扑：${file.name}`);
   } catch (error) { if (error.name !== 'AbortError') toast(`打开拓扑失败：${error.message}`); }
@@ -333,12 +353,18 @@ function renderInspector() {
     if (!node) { selection = null; renderInspector(); return; }
     const connected = topology.links.filter(l => l.source === node.id || l.target === node.id);
     const guiControls = node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机：同交换机网段的设备共享 Docker bridge，不需要配置 IP。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>使用 kasmweb/ubuntu-focal-desktop:1.16.0</small></span></label>${node.gui ? `<div class="gui-credentials"><div class="credential-title">GUI 登录信息</div><div class="credential-row"><span>地址</span><code>https://localhost:${guiPort(node.id)}</code></div><div class="credential-row"><span>用户名</span><code>${GUI_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.guiPassword)}</code></div><button type="button" data-copy-gui>复制登录信息</button><small>密码会同步写入生成项目的 .env。桌面终端执行 <code>sudo -i</code> 可进入容器内 root，无需额外密码。</small></div>` : ''}`;
-    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
+    const serverIp = nodeIps(node)[0] || '<服务器IP>';
+    const serverControls = node.type === 'server' ? `<div class="gui-credentials"><div class="credential-title">服务器登录信息</div><div class="credential-row"><span>用户名</span><code>${SERVER_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.serverPassword)}</code></div><div class="credential-row"><span>SSH</span><code>ssh ${SERVER_USERNAME}@${esc(serverIp)}</code></div><div class="credential-row"><span>FTP</span><code>ftp ${esc(serverIp)}</code></div><div class="credential-row"><span>HTTP</span><code>http://${esc(serverIp)}/</code></div><button type="button" data-copy-server>复制服务器信息</button><small>SSH 使用 22 端口，FTP 使用 21 端口和被动端口 30000–30009，Apache 使用 80 端口。密码会写入生成项目的 .env。</small></div>` : '';
+    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}${serverControls}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
     body.querySelector('[data-node-field="name"]').addEventListener('input', event => { node.name = event.target.value; save(); renderNodes(); });
     body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; save(); render(); });
     body.querySelector('[data-node-field="gui"]')?.addEventListener('change', event => { node.gui = event.target.checked; save(); render(); if (node.gui) toast('GUI 登录信息和 root 使用方式已显示在属性面板'); });
     body.querySelector('[data-copy-gui]')?.addEventListener('click', async () => {
       try { await navigator.clipboard.writeText(`地址：https://localhost:${guiPort(node.id)}\n用户名：${GUI_USERNAME}\n密码：${topology.guiPassword}\n容器内 root：在桌面终端执行 sudo -i（无需密码）`); toast('GUI 登录信息已复制'); }
+      catch (error) { toast(`复制失败：${error.message}`); }
+    });
+    body.querySelector('[data-copy-server]')?.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(`用户名：${SERVER_USERNAME}\n密码：${topology.serverPassword}\nSSH：ssh ${SERVER_USERNAME}@${serverIp}\nFTP：ftp ${serverIp}\nHTTP：http://${serverIp}/`); toast('服务器登录信息已复制'); }
       catch (error) { toast(`复制失败：${error.message}`); }
     });
     return;

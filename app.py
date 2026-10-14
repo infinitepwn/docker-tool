@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import ipaddress
 import json
@@ -21,11 +22,14 @@ OPENWRT_ARCHIVE = ROOT / "assets" / "openwrt-armsr-armv8-rootfs.tar.gz"
 OPENWRT_BUNDLE_PATH = "assets/openwrt-armsr-armv8-rootfs.tar.gz"
 GUI_IMAGE = "kasmweb/ubuntu-focal-desktop:1.16.0"
 GUI_USERNAME = "kasm_user"
+SERVER_USERNAME = "lab"
 KINDS = {"client", "router", "server", "switch"}
 ID_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,39}$")
 MAC_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 HOSTNAME_PATTERN = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 GUI_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+SERVER_PASSWORD_PATTERN = GUI_PASSWORD_PATTERN
+PROJECT_NAME_PATTERN = re.compile(r"^topology-lab-[a-z0-9]{8,24}$")
 
 
 class TopologyError(ValueError):
@@ -249,7 +253,7 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                 "ENV PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
                 "LABEL topology.role=router\n")
     if gui:
-        packages = "sudo apache2" if kind == "server" else "sudo"
+        packages = "sudo apache2 openssh-server vsftpd" if kind == "server" else "sudo"
         install_steps = [
             "apt-get update",
             f"apt-get install -y --no-install-recommends {packages}",
@@ -258,12 +262,16 @@ def dockerfile(kind: str, gui: bool = False) -> str:
         ]
         if kind == "server":
             install_steps.extend([
+                f"(id -u {SERVER_USERNAME} >/dev/null 2>&1 || useradd -m -s /bin/bash {SERVER_USERNAME})",
+                "mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d",
+                "printf '%s\\n' 'PasswordAuthentication yes' 'PermitRootLogin no' > /etc/ssh/sshd_config.d/topology.conf",
+                "printf '%s\\n' 'listen=YES' 'listen_ipv6=NO' 'background=YES' 'anonymous_enable=NO' 'local_enable=YES' 'write_enable=YES' 'local_umask=022' 'chroot_local_user=YES' 'allow_writeable_chroot=YES' 'pam_service_name=vsftpd' 'secure_chroot_dir=/var/run/vsftpd/empty' 'pasv_enable=YES' 'pasv_min_port=30000' 'pasv_max_port=30009' 'seccomp_sandbox=NO' > /etc/vsftpd.conf",
                 "printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf",
                 "a2enconf topology-server-name",
             ])
         install_steps.append("rm -rf /var/lib/apt/lists/*")
         install_command = " \\\n    && ".join(install_steps)
-        expose = "EXPOSE 80\n" if kind == "server" else ""
+        expose = "EXPOSE 21 22 80 30000-30009\n" if kind == "server" else ""
         return (f"FROM {GUI_IMAGE}\n"
                 "USER root\n"
                 f"RUN {install_command}\n"
@@ -274,14 +282,20 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                 "procps util-linux iproute2 iputils-ping dnsutils traceroute "
                 "curl wget tcpdump net-tools hping3 nmap python3 python3-scapy")
     if kind == "server":
-        packages += " apache2"
-    apache_setup = ("RUN printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf && a2enconf topology-server-name\n"
-                    "EXPOSE 80\n" if kind == "server" else "")
+        packages += " apache2 openssh-server vsftpd"
+    server_setup = (
+        f"RUN (id -u {SERVER_USERNAME} >/dev/null 2>&1 || useradd -m -s /bin/bash {SERVER_USERNAME}) "
+        "&& mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d "
+        "&& printf '%s\\n' 'PasswordAuthentication yes' 'PermitRootLogin no' > /etc/ssh/sshd_config.d/topology.conf "
+        "&& printf '%s\\n' 'listen=YES' 'listen_ipv6=NO' 'background=YES' 'anonymous_enable=NO' 'local_enable=YES' 'write_enable=YES' 'local_umask=022' 'chroot_local_user=YES' 'allow_writeable_chroot=YES' 'pam_service_name=vsftpd' 'secure_chroot_dir=/var/run/vsftpd/empty' 'pasv_enable=YES' 'pasv_min_port=30000' 'pasv_max_port=30009' 'seccomp_sandbox=NO' > /etc/vsftpd.conf "
+        "&& printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf "
+        "&& a2enconf topology-server-name\n"
+        "EXPOSE 21 22 80 30000-30009\n" if kind == "server" else "")
     return ("FROM ubuntu:24.04\n"
             "ENV DEBIAN_FRONTEND=noninteractive\n"
             f"RUN apt-get update && apt-get install -y --no-install-recommends {packages} "
             "&& rm -rf /var/lib/apt/lists/*\n"
-            f"{apache_setup}"
+            f"{server_setup}"
             "ENV SHELL=/bin/bash HOME=/root TERM=xterm-256color\n"
             "WORKDIR /root\n"
             "RUN printf '%s\\n' 'export PS1=\"\\u@\\h:\\w\\$ \"' > /root/.bashrc\n"
@@ -292,12 +306,25 @@ def dockerfile(kind: str, gui: bool = False) -> str:
 def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     nodes, links = normalize(data)
     gui_nodes = [node for node in nodes if node["gui"]]
+    server_nodes = [node for node in nodes if node["type"] == "server"]
     gui_password = data.get("guiPassword") if isinstance(data, dict) else None
+    server_password = data.get("serverPassword") if isinstance(data, dict) else None
+    project_name = data.get("projectName") if isinstance(data, dict) else None
+    if project_name is None:
+        identity = json.dumps([node["id"] for node in nodes], ensure_ascii=True, separators=(",", ":"))
+        project_name = "topology-lab-" + hashlib.sha256(identity.encode()).hexdigest()[:12]
+    if not isinstance(project_name, str) or not PROJECT_NAME_PATTERN.fullmatch(project_name):
+        raise TopologyError("项目标识无效")
     if gui_nodes:
         if gui_password is None:
             gui_password = secrets.token_urlsafe(16)
         if not isinstance(gui_password, str) or not GUI_PASSWORD_PATTERN.fullmatch(gui_password):
             raise TopologyError("GUI 密码必须为 8–64 位字母、数字、下划线或连字符")
+    if server_nodes:
+        if server_password is None:
+            server_password = secrets.token_urlsafe(16)
+        if not isinstance(server_password, str) or not SERVER_PASSWORD_PATTERN.fullmatch(server_password):
+            raise TopologyError("服务器密码必须为 8–64 位字母、数字、下划线或连字符")
     has_router = any(node["type"] == "router" for node in nodes)
     if has_router and not OPENWRT_ARCHIVE.is_file():
         raise TopologyError("缺少 OpenWrt rootfs，请将归档放入 assets/openwrt-armsr-armv8-rootfs.tar.gz")
@@ -316,7 +343,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     for segment in segments:
         for member, interface in segment["members"].items():
             attachments[member].append((segment["key"], interface))
-    lines = ["name: topology-lab", "services:"]
+    lines = [f"name: {project_name}", "services:"]
     files = {}
     gui_ports = {}
     next_gui_port = 6901
@@ -342,16 +369,29 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         if gui:
             gui_ports[node_id] = next_gui_port
             next_gui_port += 1
+            lines.append("    shm_size: 512m")
+        if gui or kind == "server":
+            lines.append("    environment:")
+            if gui:
+                lines.append("      VNC_PW: ${VNC_PW}")
+            if kind == "server":
+                lines.append("      SERVER_PASSWORD: ${SERVER_PASSWORD}")
+        if gui:
             lines.extend([
-                "    shm_size: 512m",
-                "    environment:",
-                "      VNC_PW: ${VNC_PW}",
                 "    ports:",
                 f"      - \"127.0.0.1:{gui_ports[node_id]}:6901\"",
             ])
         if kind == "router":
             lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"1\""])
         startup = list(commands[node_id])
+        if kind == "server":
+            startup.extend([
+                f"printf '{SERVER_USERNAME}:%s\\n' \"$${{SERVER_PASSWORD}}\" | chpasswd",
+                "mkdir -p /run/sshd /var/run/vsftpd/empty",
+                "ssh-keygen -A",
+                "/usr/sbin/sshd",
+                "/usr/sbin/vsftpd /etc/vsftpd.conf",
+            ])
         if gui:
             hook = startup + (["apache2ctl start"] if kind == "server" else [])
             if hook:
@@ -382,14 +422,19 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             f"        - subnet: {segment['subnet']}",
         ])
     files["compose.yaml"] = "\n".join(lines) + "\n"
+    environment = []
     if gui_ports:
-        files[".env"] = f"VNC_PW={gui_password}\n"
+        environment.append(f"VNC_PW={gui_password}")
+    if server_nodes:
+        environment.append(f"SERVER_PASSWORD={server_password}")
+    if environment:
+        files[".env"] = "\n".join(environment) + "\n"
     readme = ["# Generated topology", "", "Run `docker compose up --build -d` in this directory.", "When replacing an existing generated topology, run `docker compose down` first so Docker recreates the networks with the current driver options.", "Use `docker compose ps` to inspect containers and `docker compose down` to stop them.", "", "## Nodes", ""]
     for node in nodes:
         suffix = "，GUI" if node["gui"] else ""
         detail = "（Docker bridge 虚拟二层交换机，不创建容器）" if node["type"] == "switch" else ""
         readme.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix}){detail}" + (f"; container=`{node_container_name(node)}`, hostname=`{node_hostname(node)}`" if node["type"] != "switch" else ""))
-    readme.extend(["", "Every physical node container runs with `privileged: true`, allowing full container capabilities and device access for lab modifications. Switch nodes are Docker bridges and do not create containers.", "Changes made only inside a running container are lost when that container is rebuilt; put persistent changes in its Dockerfile or a mounted volume.", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "Every server node runs Apache HTTP Server on container port 80; access it from the topology with `http://<server-ip>/`. Apache's document root is `/var/www/html`.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
+    readme.extend(["", "Every physical node container runs with `privileged: true`, allowing full container capabilities and device access for lab modifications. Switch nodes are Docker bridges and do not create containers.", "Changes made only inside a running container are lost when that container is rebuilt; put persistent changes in its Dockerfile or a mounted volume.", "Client/server non-GUI images include Bash and common Linux tools; interactive Bash displays `root@hostname:~#`. Enter with `docker exec -it <container-name> bash`.", "Every server node runs Apache HTTP Server on container port 80; access it from the topology with `http://<server-ip>/`. Apache's document root is `/var/www/html`.", "Every server also runs OpenSSH on port 22 and vsftpd on port 21. Sign in as `lab` with `SERVER_PASSWORD` from `.env`. FTP passive mode uses ports 30000–30009 inside the topology network.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
     for segment in segments:
         participants = ", ".join(f"{node_id}={iface['ip']}" for node_id, iface in segment["members"].items())
         readme.append(f"- `net_{segment['key']}` `{segment['subnet']}`: {participants}")
@@ -403,15 +448,19 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         readme.extend(["", "## GUI access", "", f"Open the following local HTTPS URLs after starting Compose. Sign in as `{GUI_USERNAME}`; the password is `VNC_PW` in `.env`.", ""])
         readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
         readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also runs Apache on container port 80."])
+    if server_nodes:
+        readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     if warnings:
         readme.extend(["", "## Connectivity notes", ""])
         readme.extend(f"- {warning}" for warning in warnings)
     files["README.md"] = "\n".join(readme) + "\n"
-    topology_snapshot = {"nodes": nodes, "links": links}
+    topology_snapshot = {"projectName": project_name, "nodes": nodes, "links": links}
     if gui_ports:
         topology_snapshot["guiPassword"] = gui_password
+    if server_nodes:
+        topology_snapshot["serverPassword"] = server_password
     files["topology.json"] = json.dumps(topology_snapshot, ensure_ascii=False, indent=2) + "\n"
     return files, warnings
 

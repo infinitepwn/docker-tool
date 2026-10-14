@@ -47,6 +47,8 @@
 
   `driver_opts` 等网络配置不能原地修改，因此更新已有实验目录后需要先执行 `docker compose down`，再重新启动，让 Docker 重建网络。
 
+  每个保存的拓扑都会持有独立的 Compose 项目标识，生成到不同目录的实验不会因为默认项目名相同而停止或替换彼此的容器。
+
   如需确保完全重新构建镜像，可运行：
 
   ```
@@ -75,7 +77,21 @@
   curl http://192.168.2.11
   ```
 
-  以上节点名和 IP 只是示例，应按当前拓扑修改。服务器默认使用 Apache HTTP Server，在容器的 80 端口提供服务，网站目录为 `/var/www/html`。
+  以上节点名和 IP 只是示例，应按当前拓扑修改。服务器默认同时运行 Apache HTTP Server、OpenSSH 和 vsftpd：HTTP 使用 80 端口，SSH 使用 22 端口，FTP 使用 21 端口及被动端口 30000–30009。网站目录为 `/var/www/html`。
+
+  ## 服务器 HTTP、SSH 与 FTP
+
+  新建服务器节点后，属性面板会显示服务器 IP、用户名 `lab` 和随机密码，并可一键复制。该密码随拓扑保存，并写入生成项目的 `.env` 中作为 `SERVER_PASSWORD`。所有服务器节点共用这组实验账户信息。
+
+  拓扑启动后，可从能够到达该服务器 IP 的节点连接：
+
+  ```
+  ssh lab@192.168.2.11
+  ftp 192.168.2.11
+  curl http://192.168.2.11/
+  ```
+
+  FTP 支持本地用户读写，默认目录是 `/home/lab`，被动模式使用容器内部的 30000–30009 端口。服务仅通过拓扑网络地址访问，生成器不会把 SSH、FTP 或 HTTP 端口发布到宿主机。
 
   ## 容器名称与交互式 Bash
 
@@ -113,7 +129,7 @@
 
   ## GUI 桌面节点
 
-  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。网页登录名是 `kasm_user`，桌面内的 Linux 账户是 `kasm-user`；在桌面终端执行 `sudo -i` 即可免密进入容器内 root。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器同样使用 Apache，并在容器内 80 端口提供 HTTP 服务。
+  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。网页登录名是 `kasm_user`，桌面内的 Linux 账户是 `kasm-user`；在桌面终端执行 `sudo -i` 即可免密进入容器内 root。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器同样运行 Apache、OpenSSH 和 vsftpd。
 
   ## 安全与注意事项
 
