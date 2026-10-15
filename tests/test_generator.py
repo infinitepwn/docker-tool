@@ -112,6 +112,8 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(json.loads(files["topology.json"])["projectName"], "topology-lab-test1234")
         self.assertIn("Every physical node container runs with `privileged: true`", files["README.md"])
         self.assertIn("dockerfiles/client-1.Dockerfile", files)
+        self.assertIn("netcat-openbsd", files["dockerfiles/client-1.Dockerfile"])
+        self.assertIn("netcat (`nc`)", files["README.md"])
 
     def test_rejects_overlapping_networks(self):
         data = topology()
@@ -164,6 +166,7 @@ class GeneratorTests(unittest.TestCase):
         self.assertIn("openssh-client", gui_dockerfile)
         self.assertIn("inetutils-telnet", gui_dockerfile)
         self.assertIn("inetutils-ftp", gui_dockerfile)
+        self.assertIn("netcat-openbsd", gui_dockerfile)
         self.assertIn("tcpdump", gui_dockerfile)
         self.assertIn("nmap", gui_dockerfile)
         self.assertIn("kasm-user ALL=(ALL) NOPASSWD: ALL", gui_dockerfile)

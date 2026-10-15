@@ -109,7 +109,7 @@
 
   Docker 容器名称不允许任意字符：含空格的名称会替换非法字符，无法转换成有效 ASCII 名称的节点会回退至节点 ID。转换后如有重名，生成器会报错；原始画布名称会保留在 Docker label 中。容器 hostname 对符合 DNS 主机名规则的节点名称使用原名，否则回退至节点 ID。因此建议为需要终端操作的设备使用不重复的英文、数字或连字符名称。
 
-  非 GUI 客户端和服务器基于 Ubuntu 24.04，预装 `bash`、命令补全和常见 Linux/网络工具（如 `ip`、`ping`、`curl`、`ssh`、`telnet`、`ftp`、`tcpdump`、`vim`、`traceroute` 等），默认工作目录为 `/root`，交互式 Bash 提示符采用 `root@hostname:~#` 风格。它们仍是容器，而不是拥有独立内核的完整虚拟机。
+  非 GUI 客户端和服务器基于 Ubuntu 24.04，预装 `bash`、命令补全和常见 Linux/网络工具（如 `ip`、`ping`、`curl`、`ssh`、`telnet`、`ftp`、`nc`、`tcpdump`、`vim`、`traceroute` 等），默认工作目录为 `/root`，交互式 Bash 提示符采用 `root@hostname:~#` 风格。它们仍是容器，而不是拥有独立内核的完整虚拟机。
 
   **OpenWrt 路由器除外**：路由器保留 rootfs 自带的 Shell，通常应使用 `docker exec -it <路由器容器名> sh`。
 
@@ -146,7 +146,7 @@
 
   ## GUI 桌面节点
 
-  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。GUI 镜像会安装 `ping`、`ip`、`curl`、`wget`、`ssh`、`telnet`、`ftp`、`traceroute`、`tcpdump`、`nmap`、`vim` 等常用工具。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。网页登录名是 `kasm_user`，桌面内的 Linux 账户是 `kasm-user`；在桌面终端执行 `sudo -i` 即可免密进入容器内 root。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器同样运行 Apache、OpenSSH、Telnet 和 vsftpd。
+  客户端和服务器可在节点属性中启用 GUI；此时使用 `kasmweb/ubuntu-focal-desktop:1.16.0`。GUI 镜像会安装 `ping`、`ip`、`curl`、`wget`、`ssh`、`telnet`、`ftp`、`nc`、`traceroute`、`tcpdump`、`nmap`、`vim` 等常用工具。启用后，属性面板会立即显示访问地址、用户名 `kasm_user` 和随机生成的密码，并可一键复制。该密码会保存在拓扑中并同步写入生成项目的 `.env`，确保页面提示与实际容器一致。网页登录名是 `kasm_user`，桌面内的 Linux 账户是 `kasm-user`；在桌面终端执行 `sudo -i` 即可免密进入容器内 root。访问 `https://localhost:<端口>`；此功能要求 Docker Compose v2.30+ 支持 `post_start`。GUI 服务器同样运行 Apache、OpenSSH、Telnet 和 vsftpd。
 
   ## 安全与注意事项
 
