@@ -110,7 +110,12 @@ function validateTopologyDocument(document) {
     ids.add(raw.id);
     const x = Number.isFinite(Number(raw.x)) ? Number(raw.x) : 120 + index * 35;
     const y = Number.isFinite(Number(raw.y)) ? Number(raw.y) : 160 + index * 25;
-    return {id:raw.id, name:typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : raw.id, type:raw.type, gui:(raw.type === 'client' || raw.type === 'server') && raw.gui === true, x:Math.max(0, Math.min(2240, x)), y:Math.max(0, Math.min(1520, y))};
+    const node = {id:raw.id, name:typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : raw.id, type:raw.type, gui:(raw.type === 'client' || raw.type === 'server') && raw.gui === true, x:Math.max(0, Math.min(2240, x)), y:Math.max(0, Math.min(1520, y))};
+    if (raw.mirror !== undefined && raw.mirror !== null) {
+      if (raw.type !== 'router' || !raw.mirror || typeof raw.mirror !== 'object' || ['source','target','destination'].some(field => typeof raw.mirror[field] !== 'string')) throw new Error(`第 ${index + 1} 个节点的流量镜像配置无效`);
+      node.mirror = {source:raw.mirror.source, target:raw.mirror.target, destination:raw.mirror.destination};
+    }
+    return node;
   });
   const linkIds = new Set();
   const links = document.links.map((raw, index) => {
@@ -120,6 +125,7 @@ function validateTopologyDocument(document) {
     linkIds.add(raw.id);
     return {id:raw.id, source:raw.source, target:raw.target, subnet:raw.subnet || '', sourceIp:raw.sourceIp || '', targetIp:raw.targetIp || '', sourceMac:raw.sourceMac || '', targetMac:raw.targetMac || ''};
   });
+  if (nodes.some(node => node.mirror && new Set(Object.values(node.mirror)).size !== 3)) throw new Error('流量镜像需要三个不同节点');
   let guiPassword = document.guiPassword;
   if (nodes.some(node => node.gui)) {
     if (guiPassword === undefined) guiPassword = randomPassword();
@@ -351,6 +357,26 @@ function renderEdges() {
     group.append(visible, hit, label); edgeLayer.appendChild(group);
   }
 }
+function routerMirrorCandidates(routerId) {
+  const networkByNode = new Map();
+  for (const link of topology.links.filter(item => item.source === routerId || item.target === routerId)) {
+    const group = groupLinkIds(link);
+    const network = [...group].sort().join(',');
+    for (const member of topology.links.filter(item => group.has(item.id))) {
+      for (const id of [member.source, member.target]) {
+        if (['client', 'server'].includes(nodeKind(id))) networkByNode.set(id, network);
+      }
+    }
+  }
+  return topology.nodes.filter(item => networkByNode.has(item.id)).map(item => ({node:item, network:networkByNode.get(item.id)}));
+}
+function mirrorControls(node) {
+  if (node.type !== 'router') return '';
+  const candidates = routerMirrorCandidates(node.id);
+  const fields = [['source','通信节点 A'], ['target','通信节点 B'], ['destination','镜像接收节点']];
+  const controls = !node.mirror ? '' : fields.map(([field, label]) => `<label class="form-field"><span>${label}</span><select data-mirror-field="${field}">${candidates.map(item => `<option value="${esc(item.node.id)}" ${node.mirror[field] === item.node.id ? 'selected' : ''}>${esc(item.node.name)} · ${esc(nodeIps(item.node)[0] || item.node.id)}</option>`).join('')}</select></label>`).join('');
+  return `<div class="inspector-divider"></div><div class="endpoint-title">流量镜像 <small>复制两个节点之间双向经过本路由器的 IPv4 流量</small></div><label class="gui-option"><input type="checkbox" data-mirror-enable ${node.mirror ? 'checked' : ''}><span><strong>启用流量镜像</strong><small>将报文副本发送给指定接收节点</small></span></label>${controls}<div class="form-help">三个节点需与本路由器直接相连（可以经过交换机）；通信两端位于不同网段，且网段内没有其他路由器。接收端可用 tcpdump 查看副本。</div>`;
+}
 function renderInspector() {
   const body = $('#inspectorBody'); const button = $('#deleteBtn');
   button.disabled = !selection;
@@ -362,9 +388,28 @@ function renderInspector() {
     const guiControls = node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机：同交换机网段的设备共享 Docker bridge，不需要配置 IP。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>Kasm Ubuntu 桌面，预装常用网络工具</small></span></label>${node.gui ? `<div class="gui-credentials"><div class="credential-title">GUI 登录信息</div><div class="credential-row"><span>地址</span><code>https://localhost:${guiPort(node.id)}</code></div><div class="credential-row"><span>用户名</span><code>${GUI_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.guiPassword)}</code></div><button type="button" data-copy-gui>复制登录信息</button><small>内置 ping、ip、curl、wget、SSH、Telnet、FTP、traceroute、tcpdump、nmap 等工具。执行 <code>sudo -i</code> 可免密进入 root。</small></div>` : ''}`;
     const serverIp = nodeIps(node)[0] || '<服务器IP>';
     const serverControls = node.type === 'server' ? `<div class="gui-credentials"><div class="credential-title">服务器登录信息</div><div class="credential-row"><span>用户名</span><code>${SERVER_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.serverPassword)}</code></div><div class="credential-row"><span>SSH</span><code>ssh ${SERVER_USERNAME}@${esc(serverIp)}</code></div><div class="credential-row"><span>Telnet</span><code>telnet ${esc(serverIp)} 23</code></div><div class="credential-row"><span>FTP</span><code>ftp ${esc(serverIp)}</code></div><div class="credential-row"><span>HTTP</span><code>http://${esc(serverIp)}/</code></div><button type="button" data-copy-server>复制服务器信息</button><small>SSH 使用 22 端口，Telnet 使用 23 端口，FTP 使用 21 端口和被动端口 30000–30009，Apache 使用 80 端口。密码会写入生成项目的 .env。</small></div>` : '';
-    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}${serverControls}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
+    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}${serverControls}${mirrorControls(node)}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
     body.querySelector('[data-node-field="name"]').addEventListener('input', event => { node.name = event.target.value; save(); renderNodes(); });
-    body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; save(); render(); });
+    body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; if (node.type !== 'router') delete node.mirror; for (const item of topology.nodes) if (item.mirror && Object.values(item.mirror).includes(node.id) && !['client','server'].includes(node.type)) delete item.mirror; save(); render(); });
+    body.querySelector('[data-mirror-enable]')?.addEventListener('change', event => {
+      if (!event.target.checked) { delete node.mirror; save(); renderInspector(); return; }
+      const candidates = routerMirrorCandidates(node.id);
+      const source = candidates[0];
+      const target = candidates.find(item => item.network !== source?.network);
+      const destination = candidates.find(item => item.node.id !== source?.node.id && item.node.id !== target?.node.id);
+      if (!source || !target || !destination) { event.target.checked = false; toast('请先连接至少三个节点，其中通信两端位于不同网段'); return; }
+      node.mirror = {source:source.node.id, target:target.node.id, destination:destination.node.id}; save(); renderInspector();
+    });
+    body.querySelectorAll('[data-mirror-field]').forEach(select => select.addEventListener('change', event => {
+      const field = event.target.dataset.mirrorField;
+      const updated = {...node.mirror, [field]:event.target.value};
+      const previousField = Object.keys(updated).find(other => other !== field && updated[other] === event.target.value);
+      if (previousField) updated[previousField] = node.mirror[field];
+      const candidates = routerMirrorCandidates(node.id);
+      const networks = Object.fromEntries(candidates.map(item => [item.node.id, item.network]));
+      if (new Set(Object.values(updated)).size !== 3 || networks[updated.source] === networks[updated.target]) { toast('请选择三个不同节点，通信两端要位于不同网段'); renderInspector(); return; }
+      node.mirror = updated; save(); renderInspector();
+    }));
     body.querySelector('[data-node-field="gui"]')?.addEventListener('change', event => { node.gui = event.target.checked; save(); render(); if (node.gui) toast('GUI 登录信息和 root 使用方式已显示在属性面板'); });
     body.querySelector('[data-copy-gui]')?.addEventListener('click', async () => {
       try { await navigator.clipboard.writeText(`地址：https://localhost:${guiPort(node.id)}\n用户名：${GUI_USERNAME}\n密码：${topology.guiPassword}\n容器内 root：在桌面终端执行 sudo -i（无需密码）`); toast('GUI 登录信息已复制'); }
@@ -394,7 +439,7 @@ function renderInspector() {
 function render() { renderNodes(); renderEdges(); renderInspector(); $('#counts').textContent = `${topology.nodes.length} 个节点 · ${topology.links.length} 条连线`; renderTransform(); }
 function deleteSelected() {
   if (!selection) return;
-  if (selection.kind === 'node') { topology.nodes = topology.nodes.filter(n => n.id !== selection.id); topology.links = topology.links.filter(l => l.source !== selection.id && l.target !== selection.id); }
+  if (selection.kind === 'node') { topology.nodes = topology.nodes.filter(n => n.id !== selection.id); topology.links = topology.links.filter(l => l.source !== selection.id && l.target !== selection.id); for (const node of topology.nodes) if (node.mirror && Object.values(node.mirror).includes(selection.id)) delete node.mirror; }
   else topology.links = topology.links.filter(l => l.id !== selection.id);
   selection = null; stopConnecting(); save(); render(); toast('已删除');
 }

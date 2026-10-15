@@ -24,7 +24,53 @@ def topology():
     }
 
 
+def mirrored_topology():
+    return {
+        "projectName": "topology-mirror-test",
+        "nodes": [
+            {"id": "client-1", "name": "源节点", "type": "client"},
+            {"id": "router-1", "name": "路由器", "type": "router", "mirror": {"source": "client-1", "target": "client-2", "destination": "client-3"}},
+            {"id": "client-2", "name": "目标节点", "type": "client"},
+            {"id": "client-3", "name": "镜像接收节点", "type": "client"},
+        ],
+        "links": [
+            {"id": f"link-{index}", "source": "router-1", "target": f"client-{index}", "subnet": f"10.240.{index}.0/24", "sourceIp": f"10.240.{index}.10", "targetIp": f"10.240.{index}.11", "sourceMac": f"02:42:f0:00:0{index}:01", "targetMac": f"02:42:f0:00:0{index}:02"}
+            for index in (1, 2, 3)
+        ],
+    }
+
+
 class GeneratorTests(unittest.TestCase):
+    def test_router_mirrors_bidirectional_traffic(self):
+        data = mirrored_topology()
+        files, warnings = build_files(data)
+        self.assertFalse(warnings)
+        rules = files["mirrors/router-1.nft"]
+        self.assertIn("ip saddr 10.240.1.11 ip daddr 10.240.2.11 counter dup to 10.240.3.11", rules)
+        self.assertIn("ip saddr 10.240.2.11 ip daddr 10.240.1.11 counter dup to 10.240.3.11", rules)
+        self.assertIn("COPY mirrors/router-1.nft /etc/topology-mirror.nft", files["dockerfiles/router-1.Dockerfile"])
+        self.assertIn("nft -f /etc/topology-mirror.nft", files["compose.yaml"])
+        self.assertIn('net.ipv4.ip_forward: "0"', files["compose.yaml"])
+        self.assertIn("tcpdump -ni any", files["README.md"])
+        self.assertEqual(json.loads(files["topology.json"])["nodes"][1]["mirror"], data["nodes"][1]["mirror"])
+        self.assertIn("mirrors/router-1.nft", zipfile.ZipFile(io.BytesIO(make_archive(files, True))).namelist())
+
+    def test_invalid_router_mirror_is_rejected(self):
+        data = mirrored_topology()
+        data["nodes"][1]["mirror"]["destination"] = "client-1"
+        with self.assertRaisesRegex(TopologyError, "三个不同"):
+            build_files(data)
+        data = mirrored_topology()
+        data["nodes"][1]["mirror"]["target"] = "unknown"
+        with self.assertRaisesRegex(TopologyError, "三个不同"):
+            build_files(data)
+        data = mirrored_topology()
+        data["links"][1]["subnet"] = "10.240.1.0/24"
+        data["links"][1]["sourceIp"] = "10.240.1.12"
+        data["links"][1]["targetIp"] = "10.240.1.13"
+        with self.assertRaisesRegex(TopologyError, "重叠"):
+            build_files(data)
+
     def test_multi_router_routes_and_files(self):
         data = topology()
         commands, warnings = route_commands(data["nodes"], data["links"])

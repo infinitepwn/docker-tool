@@ -139,6 +139,13 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
         if not isinstance(gui, bool) or (kind in ("router", "switch") and gui):
             raise TopologyError(f"节点 {node_id} 的 GUI 配置无效")
         node = {"id": node_id, "type": kind, "name": name.strip(), "gui": gui}
+        mirror = raw.get("mirror")
+        if mirror is not None:
+            if (kind != "router" or not isinstance(mirror, dict)
+                    or set(mirror) != {"source", "target", "destination"}
+                    or any(not isinstance(mirror[field], str) for field in ("source", "target", "destination"))):
+                raise TopologyError(f"节点 {node_id} 的流量镜像配置无效")
+            node["mirror"] = {field: mirror[field] for field in ("source", "target", "destination")}
         node_by_id[node_id] = node
         clean_nodes.append(node)
 
@@ -212,6 +219,26 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
         used_networks.append(network)
         if not segment["members"]:
             raise TopologyError(f"交换机网段 {segment['subnet']} 没有连接任何主机或路由器")
+    for node in clean_nodes:
+        mirror = node.get("mirror")
+        if not mirror:
+            continue
+        endpoints = [mirror[field] for field in ("source", "target", "destination")]
+        if len(set(endpoints)) != 3 or any(endpoint not in node_by_id or node_by_id[endpoint]["type"] not in ("client", "server") for endpoint in endpoints):
+            raise TopologyError(f"路由器「{node['name']}」的流量镜像须选择三个不同的客户端或服务器节点")
+        member_segments = {}
+        for segment in segments:
+            for endpoint in endpoints:
+                if endpoint in segment["members"]:
+                    member_segments[endpoint] = segment
+        if any(node["id"] not in member_segments[endpoint]["members"] for endpoint in endpoints):
+            raise TopologyError(f"流量镜像的三个节点都必须与路由器「{node['name']}」处于直接相连的网段")
+        if member_segments[mirror["source"]] is member_segments[mirror["target"]]:
+            raise TopologyError(f"流量镜像的通信两端必须位于路由器「{node['name']}」连接的不同网段")
+        for endpoint in (mirror["source"], mirror["target"]):
+            routers = [member for member in member_segments[endpoint]["members"] if node_by_id[member]["type"] == "router"]
+            if routers != [node["id"]]:
+                raise TopologyError(f"流量镜像的通信网段只能连接路由器「{node['name']}」，以确保流量经过它")
     return clean_nodes, clean_links
 
 
@@ -358,6 +385,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         container_names[key] = node["name"]
     segments = topology_segments(nodes, links)
     commands, warnings = route_commands(nodes, links)
+    mirror_receivers = {node["mirror"]["destination"] for node in nodes if node.get("mirror")}
     attachments = {node["id"]: [] for node in nodes if node["type"] != "switch"}
     for segment in segments:
         for member, interface in segment["members"].items():
@@ -370,7 +398,28 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         node_id, kind, gui = node["id"], node["type"], node["gui"]
         if kind == "switch":
             continue  # One bridge per L2 domain; no pretend switch container.
-        files[f"dockerfiles/{node_id}.Dockerfile"] = dockerfile(kind, gui)
+        node_dockerfile = dockerfile(kind, gui)
+        mirror = node.get("mirror")
+        if mirror:
+            endpoint_ips = {}
+            for segment in segments:
+                for endpoint in mirror.values():
+                    if endpoint in segment["members"]:
+                        endpoint_ips[endpoint] = segment["members"][endpoint]["ip"]
+            source_ip = endpoint_ips[mirror["source"]]
+            target_ip = endpoint_ips[mirror["target"]]
+            destination_ip = endpoint_ips[mirror["destination"]]
+            files[f"mirrors/{node_id}.nft"] = (
+                f"table ip topology_mirror_{node_id.replace('-', '_')} {{\n"
+                "  chain prerouting {\n"
+                "    type filter hook prerouting priority mangle; policy accept;\n"
+                f"    ip saddr {source_ip} ip daddr {target_ip} counter dup to {destination_ip}\n"
+                f"    ip saddr {target_ip} ip daddr {source_ip} counter dup to {destination_ip}\n"
+                "  }\n"
+                "}\n"
+            )
+            node_dockerfile += f"COPY mirrors/{node_id}.nft /etc/topology-mirror.nft\n"
+        files[f"dockerfiles/{node_id}.Dockerfile"] = node_dockerfile
         lines.extend([
             f"  {node_id}:",
             "    build:",
@@ -402,7 +451,11 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             ])
         if kind == "router":
             lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"1\""])
+        elif node_id in mirror_receivers:
+            lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"0\""])
         startup = list(commands[node_id])
+        if mirror:
+            startup.append("nft -f /etc/topology-mirror.nft")
         if kind == "server":
             startup.extend([
                 f"printf '{SERVER_USERNAME}:%s\\n' \"$${{SERVER_PASSWORD}}\" | chpasswd",
@@ -472,6 +525,15 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- Telnet: `telnet <server-ip> 23`", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
+    mirrors = [node for node in nodes if node.get("mirror")]
+    if mirrors:
+        readme.extend(["", "## Traffic mirroring", "", "Each configured OpenWrt router uses nftables to duplicate IPv4 packets in both directions between the selected endpoints. The receiver must be directly connected to that router; mirrored packets keep their original IP headers, so inspect them with tcpdump rather than expecting an application on the receiver to accept them.", ""])
+        node_by_id = {node["id"]: node for node in nodes}
+        for node in mirrors:
+            mirror = node["mirror"]
+            receiver = node_by_id[mirror["destination"]]
+            readme.append(f"- `{node['id']}`: `{mirror['source']}` ↔ `{mirror['target']}` → `{mirror['destination']}`; capture with `docker exec -it {node_container_name(receiver)} tcpdump -ni any`.")
+        readme.append("Inspect rule counters on a router with `docker exec -it <router-container> nft list table ip topology_mirror_<router-id-with-underscores>`.")
     if warnings:
         readme.extend(["", "## Connectivity notes", ""])
         readme.extend(f"- {warning}" for warning in warnings)
