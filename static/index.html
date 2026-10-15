@@ -30,7 +30,7 @@
     <main class="main">
       <header class="topbar">
         <div class="heading"><span class="eyebrow">WORKSPACE / NETWORK TOPOLOGY</span><h1>网络拓扑设计器</h1><p>画出网络结构，生成可运行的 Docker Compose 项目。</p></div>
-        <div class="top-actions"><button class="quiet-button" id="sampleBtn">加载示例</button><button class="quiet-button" id="clearBtn">清空画布</button><button class="quiet-button" id="openTopologyBtn">打开拓扑</button><button class="secondary-button" id="saveTopologyBtn">保存拓扑</button><button class="secondary-button" id="saveLocalBtn">▣ 选择文件夹并生成</button><button class="primary-button" id="downloadBtn"><span>↓</span> 下载项目 ZIP</button></div>
+        <div class="top-actions"><button class="quiet-button" id="sampleBtn">加载示例</button><button class="quiet-button" id="clearBtn">清空画布</button><button class="quiet-button" id="openTopologyBtn">打开拓扑</button><button class="secondary-button" id="saveTopologyBtn">保存拓扑</button><button class="secondary-button" id="saveLocalBtn" disabled>▣ 选择文件夹并自动保存</button><button class="primary-button" id="downloadBtn"><span>↓</span> 下载项目 ZIP</button></div>
       </header>
 
       <div class="workspace">
@@ -43,7 +43,7 @@
         <aside class="inspector"><div class="inspector-title"><span>属性面板</span><button id="deleteBtn" class="icon-button danger" title="删除所选元素" disabled>⌫</button></div><div id="inspectorBody"></div></aside>
       </div>
 
-      <section class="output-panel"><div class="output-header"><div><span class="eyebrow">GENERATED OUTPUT</span><h2>生成预览</h2><p>拓扑变化后点击刷新预览，检查即将下载的文件。</p></div><button class="secondary-button" id="previewBtn">↻ 刷新预览</button></div><div class="output-content"><div class="file-list" id="fileList"><div class="empty-file">尚未生成文件</div></div><div class="code-pane"><div class="code-title"><span id="fileTitle">选择文件查看内容</span><button id="copyBtn" title="复制内容" disabled>复制</button></div><pre id="codeContent">添加节点与连线后，点击“刷新预览”。</pre></div></div><div class="warning-list" id="warnings"></div></section>
+      <section class="output-panel"><div class="output-header"><div><span class="eyebrow">GENERATED OUTPUT</span><h2>生成预览</h2><p>拓扑变化后点击刷新预览，检查即将下载的文件。</p></div><button class="secondary-button" id="previewBtn">↻ 刷新预览</button></div><div class="local-controls"><label class="project-field">Compose 项目名<input id="projectNameInput" maxlength="63" spellcheck="false" autocomplete="off" aria-label="Compose 项目名"></label><label class="auto-compose"><input type="checkbox" id="autoComposeInput"> 修改后自动 build 并启动</label><span id="localStatus" role="status">尚未关联本地文件夹</span><button id="disconnectLocalBtn" class="quiet-button" hidden>停止同步</button></div><div class="output-content"><div class="file-list" id="fileList"><div class="empty-file">尚未生成文件</div></div><div class="code-pane"><div class="code-title"><span id="fileTitle">选择文件查看内容</span><button id="copyBtn" title="复制内容" disabled>复制</button></div><pre id="codeContent">添加节点与连线后，点击“刷新预览”。</pre></div></div><div class="warning-list" id="warnings"></div></section>
     </main>
   </div>
   <input type="file" id="topologyFileInput" accept="application/json,.json" hidden>

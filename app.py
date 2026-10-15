@@ -7,8 +7,14 @@ import hashlib
 import io
 import ipaddress
 import json
+import os
+import platform
 import re
 import secrets
+import shutil
+import subprocess
+import tempfile
+import threading
 import zipfile
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,7 +35,9 @@ MAC_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 HOSTNAME_PATTERN = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 GUI_PASSWORD_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 SERVER_PASSWORD_PATTERN = GUI_PASSWORD_PATTERN
-PROJECT_NAME_PATTERN = re.compile(r"^topology-lab-[a-z0-9]{8,24}$")
+PROJECT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+LOCAL_PROJECTS: dict[str, dict] = {}
+LOCAL_PROJECTS_LOCK = threading.Lock()
 
 
 class TopologyError(ValueError):
@@ -319,7 +327,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         identity = json.dumps([node["id"] for node in nodes], ensure_ascii=True, separators=(",", ":"))
         project_name = "topology-lab-" + hashlib.sha256(identity.encode()).hexdigest()[:12]
     if not isinstance(project_name, str) or not PROJECT_NAME_PATTERN.fullmatch(project_name):
-        raise TopologyError("项目标识无效")
+        raise TopologyError("Compose 项目名须以小写字母或数字开头，只能包含小写字母、数字、-、_，最多 63 位")
     if gui_nodes:
         if gui_password is None:
             gui_password = secrets.token_urlsafe(16)
@@ -481,6 +489,95 @@ def make_archive(files: dict[str, str], include_openwrt: bool) -> bytes:
     return buffer.getvalue()
 
 
+def choose_local_directory() -> Path:
+    """The native picker is required because browser directory handles hide host paths."""
+    if platform.system() != "Darwin" or not shutil.which("osascript"):
+        raise NotImplementedError("此运行环境没有本机文件夹选择器")
+    result = subprocess.run(
+        ["osascript", "-e", 'POSIX path of (choose folder with prompt "选择 Docker 项目文件夹")'],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    if result.returncode:
+        if "-128" in result.stderr:
+            raise TopologyError("已取消选择文件夹")
+        raise TopologyError(f"无法选择文件夹：{result.stderr.strip() or '系统对话框出错'}")
+    directory = Path(result.stdout.rstrip("\r\n")).resolve()
+    if not directory.is_dir():
+        raise TopologyError("所选目录不存在")
+    return directory
+
+
+def project_entries(files: dict[str, str], include_openwrt: bool) -> dict[str, bytes | Path]:
+    entries: dict[str, bytes | Path] = {name: content.encode("utf-8") for name, content in files.items()}
+    if include_openwrt:
+        entries[OPENWRT_BUNDLE_PATH] = OPENWRT_ARCHIVE
+    return entries
+
+
+def safe_project_target(directory: Path, name: str) -> Path:
+    parts = Path(name).parts
+    if not parts or any(part in ("", ".", "..") for part in parts) or Path(name).is_absolute():
+        raise TopologyError("生成文件路径无效")
+    target = directory.joinpath(*parts)
+    if any(path.is_symlink() for path in (target, *list(target.parents)[:len(parts)-1])):
+        raise TopologyError(f"拒绝覆盖符号链接：{name}")
+    if not target.resolve().is_relative_to(directory.resolve()):
+        raise TopologyError(f"文件超出所选目录：{name}")
+    return target
+
+
+def write_project_file(directory: Path, name: str, contents: bytes | Path) -> bool:
+    target = safe_project_target(directory, name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(contents, bytes) and target.is_file() and target.read_bytes() == contents:
+        return False
+    if isinstance(contents, Path) and target.is_file() and target.stat().st_size == contents.stat().st_size:
+        return False
+    descriptor, temporary = tempfile.mkstemp(prefix=".topology-write-", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            if isinstance(contents, Path):
+                with contents.open("rb") as source:
+                    shutil.copyfileobj(source, stream)
+            else:
+                stream.write(contents)
+        if name == ".env":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return True
+
+
+def run_compose(directory: Path, previous_compose: str | None, compose_changed: bool) -> str:
+    if not shutil.which("docker"):
+        raise TopologyError("已写入文件，但未找到 Docker 命令。请安装并启动 Docker Desktop")
+
+    def command(*args: str) -> str:
+        try:
+            result = subprocess.run(["docker", "compose", *args], cwd=directory,
+                                    capture_output=True, text=True, timeout=900, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise TopologyError("Docker Compose 执行超时（15 分钟）") from exc
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode:
+            raise TopologyError(f"文件已写入，但 Docker Compose 失败：{output[-3000:]}")
+        return output[-3000:]
+
+    command("build")
+    if previous_compose and compose_changed:
+        # Use the last deployed definition so removed services and renamed projects stop too.
+        descriptor, temporary = tempfile.mkstemp(prefix=".topology-previous-", suffix=".yaml", dir=directory)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(previous_compose)
+            command("--project-directory", str(directory), "-f", temporary, "down", "--remove-orphans")
+        finally:
+            os.unlink(temporary)
+    return command("up", "-d", "--remove-orphans")
+
+
 class Handler(BaseHTTPRequestHandler):
     def send_bytes(self, status: int, body: bytes, mime: str, filename: str | None = None) -> None:
         self.send_response(status)
@@ -495,6 +592,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/local/capabilities":
+            body = json.dumps({"nativePicker": platform.system() == "Darwin" and bool(shutil.which("osascript"))}).encode()
+            self.send_bytes(200, body, "application/json; charset=utf-8")
+            return
         if path == "/api/assets/openwrt-rootfs":
             if not OPENWRT_ARCHIVE.is_file():
                 self.send_error(404)
@@ -511,16 +612,57 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, (STATIC / filename).read_bytes(), mime)
 
     def do_POST(self) -> None:
-        if self.path not in ("/api/preview", "/api/download"):
+        if self.path not in ("/api/preview", "/api/download", "/api/local/select", "/api/local/sync"):
             self.send_error(404)
             return
         try:
+            origin = self.headers.get("Origin")
+            if origin and origin not in (f"http://{self.headers.get('Host')}", f"https://{self.headers.get('Host')}"):
+                raise TopologyError("跨站请求已拒绝")
             length = int(self.headers.get("Content-Length", "0"))
             if length < 1 or length > 1_000_000:
                 raise TopologyError("请求内容过大或为空")
             data = json.loads(self.rfile.read(length))
+            if self.path == "/api/local/sync":
+                if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not isinstance(data.get("autoRun"), bool):
+                    raise TopologyError("本地同步请求无效")
+                with LOCAL_PROJECTS_LOCK:
+                    project = LOCAL_PROJECTS.get(data["token"])
+                if project is None:
+                    raise TopologyError("文件夹关联已失效，请重新选择")
+                files, _ = build_files(data.get("topology"))
+                has_router = any(node["type"] == "router" for node in normalize(data["topology"])[0])
+                with project["lock"]:
+                    directory = project["directory"]
+                    entries = project_entries(files, has_router)
+                    for name in entries:
+                        safe_project_target(directory, name)
+                    changed = [name for name, contents in entries.items() if write_project_file(directory, name, contents)]
+                    previous = project.get("deployed_compose") or project.get("existing_compose")
+                    should_run = data["autoRun"] and (bool(changed) or previous != files["compose.yaml"] or not project.get("deployed"))
+                    output = ""
+                    if should_run:
+                        output = run_compose(directory, previous, previous != files["compose.yaml"])
+                        project["deployed_compose"] = files["compose.yaml"]
+                        project["deployed"] = True
+                        project.pop("existing_compose", None)
+                    body = json.dumps({"changed": changed, "ran": should_run, "output": output}, ensure_ascii=False).encode()
+                self.send_bytes(200, body, "application/json; charset=utf-8")
+                return
             files, warnings = build_files(data)
             has_router = any(node["type"] == "router" for node in normalize(data)[0])
+            if self.path == "/api/local/select":
+                directory = choose_local_directory()
+                entries = project_entries(files, has_router)
+                collisions = [name for name in entries if safe_project_target(directory, name).exists()]
+                token = secrets.token_urlsafe(32)
+                with LOCAL_PROJECTS_LOCK:
+                    existing_compose = (directory / "compose.yaml").read_text(encoding="utf-8") if (directory / "topology.json").is_file() and (directory / "compose.yaml").is_file() else None
+                    LOCAL_PROJECTS[token] = {"directory": directory, "lock": threading.Lock(), "deployed": False,
+                                             "existing_compose": existing_compose}
+                body = json.dumps({"token": token, "name": directory.name, "collisions": collisions}, ensure_ascii=False).encode()
+                self.send_bytes(200, body, "application/json; charset=utf-8")
+                return
             if self.path == "/api/preview":
                 assets = ([{"path": OPENWRT_BUNDLE_PATH,
                             "size": OPENWRT_ARCHIVE.stat().st_size,
@@ -530,7 +672,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(200, body, "application/json; charset=utf-8")
             else:
                 self.send_bytes(200, make_archive(files, has_router), "application/zip", "topology-lab.zip")
-        except (TopologyError, json.JSONDecodeError, OSError) as exc:
+        except NotImplementedError as exc:
+            body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode()
+            self.send_bytes(501, body, "application/json; charset=utf-8")
+        except (TopologyError, json.JSONDecodeError, OSError, subprocess.SubprocessError) as exc:
             body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode()
             self.send_bytes(400, body, "application/json; charset=utf-8")
 

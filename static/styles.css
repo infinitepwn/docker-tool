@@ -35,3 +35,13 @@
 .gui-credentials button{width:100%;margin:9px 0 7px;border:1px solid #9fd8d0;border-radius:6px;background:#fff;color:#078f82;padding:7px;cursor:pointer;font-size:10px;font-weight:700}
 .gui-credentials button:hover{border-color:#0aa998;background:#f8fffe}
 .gui-credentials small{display:block;color:#7d969e;font-size:9px;line-height:1.5}
+.local-controls{display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:12px 22px;border-bottom:1px solid #e8eef3;font-size:11px;color:#53697a}
+.project-field{display:flex;align-items:center;gap:8px;font-weight:700}
+.project-field input{width:210px;max-width:40vw;border:1px solid #dce7ed;border-radius:7px;padding:8px 10px;color:#304357;font:inherit;font-size:11px}
+.project-field input:focus{outline:2px solid #b9eee7;border-color:#0bb5a4}
+.auto-compose{display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:700}
+.auto-compose input{accent-color:#0bb5a4}
+.auto-compose:has(input:disabled){opacity:.5;cursor:not-allowed}
+#localStatus{color:#758c9a;flex:1;min-width:150px}
+#localStatus.error{color:#c94d42}
+.local-controls .quiet-button{padding:7px 10px}
