@@ -408,7 +408,7 @@ function fitView() {
 }
 async function postJson(path, payload) {
   const response = await fetch(path, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-  if (!response.ok) { let message = `请求失败 (${response.status})`; try { message = (await response.json()).error || message; } catch (_) {} const error = new Error(message); error.status = response.status; throw error; }
+  if (!response.ok) { let details = {}; try { details = await response.json(); } catch (_) {} const error = new Error(details.error || `请求失败 (${response.status})`); error.status = response.status; error.replaceProjects = details.replaceProjects; throw error; }
   return response;
 }
 function request(path) { return postJson(path, topology); }
@@ -539,9 +539,16 @@ async function performLocalSync() {
   const autoRun = directory.mode === 'native' && $('#autoComposeInput').checked;
   localStatus(autoRun ? `正在写入「${directory.name}」并构建启动…` : `正在同步「${directory.name}」…`);
   try {
-    const result = directory.mode === 'native'
-      ? await (await postJson('/api/local/sync', {token:directory.token, topology:snapshot, autoRun})).json()
-      : await browserSync(directory.handle, snapshot);
+    let result;
+    if (directory.mode === 'native') {
+      const payload = {token:directory.token, topology:snapshot, autoRun};
+      try { result = await (await postJson('/api/local/sync', payload)).json(); }
+      catch (error) {
+        if (!Array.isArray(error.replaceProjects) || !error.replaceProjects.length) throw error;
+        if (!confirm(`同一文件夹中仍有旧项目正在运行：${error.replaceProjects.join('、')}。\n\n要启动当前项目，需要停止并删除这些旧容器；容器内未持久化的修改会丢失。确认替换？`)) throw new Error('已保留旧项目；生成文件已更新，当前项目未启动');
+        result = await (await postJson('/api/local/sync', {...payload, replaceProjects:error.replaceProjects})).json();
+      }
+    } else result = await browserSync(directory.handle, snapshot);
     if (linkedDirectory !== directory) return;
     localStatus(`已同步「${directory.name}」${result.ran ? ' · Compose 已构建并启动' : result.changed.length ? ` · 更新 ${result.changed.length} 个文件` : ' · 文件已是最新'}`);
     if (currentRevision === revision) {

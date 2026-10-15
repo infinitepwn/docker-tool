@@ -44,6 +44,12 @@ class TopologyError(ValueError):
     pass
 
 
+class ComposeReplacementRequired(TopologyError):
+    def __init__(self, projects: set[str]):
+        self.projects = sorted(projects)
+        super().__init__(f"发现同一文件夹中仍在使用的旧 Compose 项目：{', '.join(self.projects)}")
+
+
 def yaml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -550,7 +556,29 @@ def write_project_file(directory: Path, name: str, contents: bytes | Path) -> bo
     return True
 
 
-def run_compose(directory: Path, previous_compose: str | None, compose_changed: bool) -> str:
+def compose_projects_for_directory(directory: Path) -> set[str]:
+    """Find running or stopped Compose projects tied to this exact output file."""
+    result = subprocess.run(["docker", "compose", "ls", "--all", "--format", "json"],
+                            capture_output=True, text=True, timeout=30, check=False)
+    if result.returncode:
+        raise TopologyError(f"无法检查现有 Compose 项目：{result.stderr.strip()[-1000:]}")
+    try:
+        projects = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise TopologyError("无法解析现有 Compose 项目列表") from exc
+    target = (directory / "compose.yaml").resolve()
+    matches = set()
+    for project in projects:
+        files = project.get("ConfigFiles", "")
+        if isinstance(files, str) and any(Path(path.strip()).resolve() == target for path in files.split(",") if path.strip()):
+            name = project.get("Name")
+            if isinstance(name, str) and PROJECT_NAME_PATTERN.fullmatch(name):
+                matches.add(name)
+    return matches
+
+
+def run_compose(directory: Path, previous_compose: str | None, compose_changed: bool,
+                approved_replacements: set[str] | None = None) -> str:
     if not shutil.which("docker"):
         raise TopologyError("已写入文件，但未找到 Docker 命令。请安装并启动 Docker Desktop")
 
@@ -565,16 +593,34 @@ def run_compose(directory: Path, previous_compose: str | None, compose_changed: 
             raise TopologyError(f"文件已写入，但 Docker Compose 失败：{output[-3000:]}")
         return output[-3000:]
 
+    current_compose = (directory / "compose.yaml").read_text(encoding="utf-8")
+    current_match = re.match(r"^name: ([a-z0-9][a-z0-9_-]*)$", current_compose.splitlines()[0])
+    if not current_match:
+        raise TopologyError("已写入文件，但 Compose 项目名无效")
+    current_name = current_match.group(1)
+    linked_projects = compose_projects_for_directory(directory)
+    old_projects = linked_projects - {current_name}
+    unapproved = old_projects - (approved_replacements or set())
+    if unapproved:
+        raise ComposeReplacementRequired(unapproved)
     command("build")
+    stopped_projects = set()
     if previous_compose and compose_changed:
         # Use the last deployed definition so removed services and renamed projects stop too.
+        previous_match = re.match(r"^name: ([a-z0-9][a-z0-9_-]*)$", previous_compose.splitlines()[0])
         descriptor, temporary = tempfile.mkstemp(prefix=".topology-previous-", suffix=".yaml", dir=directory)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(previous_compose)
             command("--project-directory", str(directory), "-f", temporary, "down", "--remove-orphans")
+            if previous_match:
+                stopped_projects.add(previous_match.group(1))
         finally:
             os.unlink(temporary)
+    for old_name in sorted(old_projects - stopped_projects):
+        # A rename can leave the old project running even when its compose.yaml
+        # has already been overwritten. -p targets only that same-folder project.
+        command("-p", old_name, "down", "--remove-orphans")
     return command("up", "-d", "--remove-orphans")
 
 
@@ -626,6 +672,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/local/sync":
                 if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not isinstance(data.get("autoRun"), bool):
                     raise TopologyError("本地同步请求无效")
+                replacements = data.get("replaceProjects", [])
+                if not isinstance(replacements, list) or any(not isinstance(name, str) or not PROJECT_NAME_PATTERN.fullmatch(name) for name in replacements):
+                    raise TopologyError("旧项目确认信息无效")
                 with LOCAL_PROJECTS_LOCK:
                     project = LOCAL_PROJECTS.get(data["token"])
                 if project is None:
@@ -642,7 +691,7 @@ class Handler(BaseHTTPRequestHandler):
                     should_run = data["autoRun"] and (bool(changed) or previous != files["compose.yaml"] or not project.get("deployed"))
                     output = ""
                     if should_run:
-                        output = run_compose(directory, previous, previous != files["compose.yaml"])
+                        output = run_compose(directory, previous, previous != files["compose.yaml"], set(replacements))
                         project["deployed_compose"] = files["compose.yaml"]
                         project["deployed"] = True
                         project.pop("existing_compose", None)
@@ -672,6 +721,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(200, body, "application/json; charset=utf-8")
             else:
                 self.send_bytes(200, make_archive(files, has_router), "application/zip", "topology-lab.zip")
+        except ComposeReplacementRequired as exc:
+            body = json.dumps({"error": str(exc), "replaceProjects": exc.projects}, ensure_ascii=False).encode()
+            self.send_bytes(409, body, "application/json; charset=utf-8")
         except NotImplementedError as exc:
             body = json.dumps({"error": str(exc)}, ensure_ascii=False).encode()
             self.send_bytes(501, body, "application/json; charset=utf-8")

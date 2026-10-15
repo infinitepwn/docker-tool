@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app import Handler, LOCAL_PROJECTS, ThreadingHTTPServer, TopologyError, build_files, run_compose, safe_project_target
+from app import ComposeReplacementRequired, Handler, LOCAL_PROJECTS, ThreadingHTTPServer, TopologyError, build_files, run_compose, safe_project_target
 
 
 def sample(name="my_lab"):
@@ -85,18 +85,78 @@ class LocalProjectTests(unittest.TestCase):
 
     def test_auto_compose_builds_then_replaces_old_project(self):
         with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "compose.yaml").write_text("name: new_lab\nservices: {}\n")
             calls = []
 
             def fake_run(args, **kwargs):
                 calls.append(args)
-                return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+                return SimpleNamespace(returncode=0, stdout="[]" if "ls" in args else "ok", stderr="")
 
             with patch("app.shutil.which", return_value="/usr/local/bin/docker"), patch("app.subprocess.run", side_effect=fake_run):
                 run_compose(Path(temporary), "name: older_lab\nservices: {}\n", True)
-            self.assertEqual(calls[0], ["docker", "compose", "build"])
-            self.assertEqual(calls[1][0:2], ["docker", "compose"])
-            self.assertEqual(calls[1][-2:], ["down", "--remove-orphans"])
-            self.assertEqual(calls[2], ["docker", "compose", "up", "-d", "--remove-orphans"])
+            self.assertEqual(calls[0], ["docker", "compose", "ls", "--all", "--format", "json"])
+            self.assertEqual(calls[1], ["docker", "compose", "build"])
+            self.assertEqual(calls[2][-2:], ["down", "--remove-orphans"])
+            self.assertEqual(calls[3], ["docker", "compose", "up", "-d", "--remove-orphans"])
+
+    def test_detects_old_project_after_compose_name_was_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "compose.yaml").write_text("name: lab3\nservices: {}\n")
+            projects = [{"Name": "topology-lab", "ConfigFiles": str(root / "compose.yaml")},
+                        {"Name": "unrelated", "ConfigFiles": "/another/project/compose.yaml"}]
+            calls = []
+
+            def fake_run(args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(returncode=0, stdout=json.dumps(projects) if "ls" in args else "ok", stderr="")
+
+            with patch("app.shutil.which", return_value="/usr/local/bin/docker"), patch("app.subprocess.run", side_effect=fake_run):
+                with self.assertRaises(ComposeReplacementRequired):
+                    run_compose(root, None, False)
+                self.assertEqual(len(calls), 1)
+                calls.clear()
+                run_compose(root, None, False, {"topology-lab"})
+            self.assertEqual(calls[1], ["docker", "compose", "build"])
+            self.assertEqual(calls[2], ["docker", "compose", "-p", "topology-lab", "down", "--remove-orphans"])
+            self.assertEqual(calls[3], ["docker", "compose", "up", "-d", "--remove-orphans"])
+
+    def test_sync_requires_explicit_confirmation_for_other_project_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            token = None
+            try:
+                def post(path, payload):
+                    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                    connection.request("POST", path, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    content = json.loads(response.read())
+                    connection.close()
+                    return response.status, content
+
+                def guarded_run(directory, previous, changed, approved):
+                    if "old_lab" not in approved:
+                        raise ComposeReplacementRequired({"old_lab"})
+                    return "started"
+
+                with patch("app.choose_local_directory", return_value=Path(temporary)), patch("app.run_compose", side_effect=guarded_run):
+                    status, selected = post("/api/local/select", sample())
+                    self.assertEqual(status, 200)
+                    token = selected["token"]
+                    payload = {"token": token, "topology": sample(), "autoRun": True}
+                    status, blocked = post("/api/local/sync", payload)
+                    self.assertEqual(status, 409)
+                    self.assertEqual(blocked["replaceProjects"], ["old_lab"])
+                    status, completed = post("/api/local/sync", {**payload, "replaceProjects": ["old_lab"]})
+                    self.assertEqual(status, 200)
+                    self.assertTrue(completed["ran"])
+            finally:
+                if token:
+                    LOCAL_PROJECTS.pop(token, None)
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":
