@@ -640,11 +640,65 @@ def compose_projects_for_directory(directory: Path) -> set[str]:
 
 
 def run_compose(directory: Path, previous_compose: str | None, compose_changed: bool,
-                approved_replacements: set[str] | None = None) -> str:
+                approved_replacements: set[str] | None = None, progress=None) -> str:
     if not shutil.which("docker"):
         raise TopologyError("已写入文件，但未找到 Docker 命令。请安装并启动 Docker Desktop")
 
-    def command(*args: str) -> str:
+    build_steps: dict[str, tuple[str, int, int]] = {}
+    build_totals: dict[str, int] = {}
+    build_done: set[tuple[str, int]] = set()
+    build_percent = 15
+
+    def command(*args: str, phase: str) -> str:
+        nonlocal build_percent
+        if progress:
+            output_lines: deque[str] = deque(maxlen=100)
+            command_line = ["docker", "compose", "--ansi", "never", "--progress", "plain", *args]
+            process = subprocess.Popen(command_line, cwd=directory, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, bufsize=1)
+            expired = threading.Event()
+
+            def stop_on_timeout():
+                expired.set()
+                process.kill()
+
+            timer = threading.Timer(900, stop_on_timeout)
+            timer.start()
+            try:
+                assert process.stdout is not None
+                for raw_line in process.stdout:
+                    line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw_line).strip()
+                    if not line:
+                        continue
+                    output_lines.append(line)
+                    if phase == "build":
+                        started = re.match(r"#(\d+) \[(?:(.+?) )?(\d+)/(\d+)\]", line)
+                        if started:
+                            step_id, service, step, total = started.groups()
+                            service = service or "default"
+                            build_steps[step_id] = (service, int(step), int(total))
+                            build_totals[service] = max(build_totals.get(service, 0), int(total))
+                        finished = re.match(r"#(\d+) (?:DONE|CACHED)\b", line)
+                        if finished and finished.group(1) in build_steps:
+                            service, step, _ = build_steps[finished.group(1)]
+                            build_done.add((service, step))
+                        if build_totals:
+                            fraction = len(build_done) / sum(build_totals.values())
+                            build_percent = max(build_percent, min(84, 15 + int(69 * fraction)))
+                        progress("build", build_percent, line[:240])
+                    else:
+                        progress(phase, 90 if phase == "down" else 95, line[:240])
+                returncode = process.wait()
+            finally:
+                timer.cancel()
+                process.stdout.close()
+            if expired.is_set():
+                raise TopologyError("Docker Compose 执行超时（15 分钟）")
+            output = "\n".join(output_lines)[-3000:]
+            if returncode:
+                raise TopologyError(f"文件已写入，但 Docker Compose 失败：{output}")
+            return output
         try:
             result = subprocess.run(["docker", "compose", *args], cwd=directory,
                                     capture_output=True, text=True, timeout=900, check=False)
@@ -660,12 +714,18 @@ def run_compose(directory: Path, previous_compose: str | None, compose_changed: 
     if not current_match:
         raise TopologyError("已写入文件，但 Compose 项目名无效")
     current_name = current_match.group(1)
+    if progress:
+        progress("check", 12, "检查现有 Docker Compose 项目…")
     linked_projects = compose_projects_for_directory(directory)
     old_projects = linked_projects - {current_name}
     unapproved = old_projects - (approved_replacements or set())
     if unapproved:
         raise ComposeReplacementRequired(unapproved)
-    command("build")
+    if progress:
+        progress("build", 15, "开始构建镜像…")
+    command("build", phase="build")
+    if progress:
+        progress("build", 85, "镜像构建完成")
     stopped_projects = set()
     if previous_compose and compose_changed:
         # Use the last deployed definition so removed services and renamed projects stop too.
@@ -674,7 +734,9 @@ def run_compose(directory: Path, previous_compose: str | None, compose_changed: 
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(previous_compose)
-            command("--project-directory", str(directory), "-f", temporary, "down", "--remove-orphans")
+            if progress:
+                progress("down", 88, "停止旧项目并更新网络…")
+            command("--project-directory", str(directory), "-f", temporary, "down", "--remove-orphans", phase="down")
             if previous_match:
                 stopped_projects.add(previous_match.group(1))
         finally:
@@ -682,8 +744,57 @@ def run_compose(directory: Path, previous_compose: str | None, compose_changed: 
     for old_name in sorted(old_projects - stopped_projects):
         # A rename can leave the old project running even when its compose.yaml
         # has already been overwritten. -p targets only that same-folder project.
-        command("-p", old_name, "down", "--remove-orphans")
-    return command("up", "-d", "--remove-orphans")
+        if progress:
+            progress("down", 88, f"停止旧项目 {old_name}…")
+        command("-p", old_name, "down", "--remove-orphans", phase="down")
+    if progress:
+        progress("up", 92, "启动容器与网络…")
+    output = command("up", "-d", "--remove-orphans", phase="up")
+    if progress:
+        progress("done", 100, "构建并启动完成")
+    return output
+
+
+def sync_local_project(data: object, progress=None) -> dict:
+    if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not isinstance(data.get("autoRun"), bool):
+        raise TopologyError("本地同步请求无效")
+    replacements = data.get("replaceProjects", [])
+    if not isinstance(replacements, list) or any(not isinstance(name, str) or not PROJECT_NAME_PATTERN.fullmatch(name) for name in replacements):
+        raise TopologyError("旧项目确认信息无效")
+    with LOCAL_PROJECTS_LOCK:
+        project = LOCAL_PROJECTS.get(data["token"])
+    if project is None:
+        raise TopologyError("文件夹关联已失效，请重新选择")
+    topology = data.get("topology")
+    files, _ = build_files(topology)
+    has_router = any(node["type"] == "router" for node in normalize(topology)[0])
+    with project["lock"]:
+        directory = project["directory"]
+        entries = project_entries(files, has_router)
+        for name in entries:
+            safe_project_target(directory, name)
+        changed = []
+        if progress:
+            progress("write", 2, f"正在写入「{directory.name}」…")
+        for index, (name, contents) in enumerate(entries.items(), 1):
+            if write_project_file(directory, name, contents):
+                changed.append(name)
+            if progress:
+                progress("write", 2 + int(8 * index / len(entries)), f"检查文件：{name}")
+        previous = project.get("deployed_compose") or project.get("existing_compose")
+        should_run = data["autoRun"] and (bool(changed) or previous != files["compose.yaml"] or not project.get("deployed"))
+        output = ""
+        if should_run:
+            if progress:
+                output = run_compose(directory, previous, previous != files["compose.yaml"], set(replacements), progress=progress)
+            else:
+                output = run_compose(directory, previous, previous != files["compose.yaml"], set(replacements))
+            project["deployed_compose"] = files["compose.yaml"]
+            project["deployed"] = True
+            project.pop("existing_compose", None)
+        elif progress:
+            progress("done", 100, "文件已是最新，无需重新构建" if not changed else "文件同步完成")
+        return {"changed": changed, "ran": should_run, "output": output}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -697,6 +808,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(body)
+
+    def stream_local_sync(self, data: object) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def send_event(event: dict) -> None:
+            try:
+                self.wfile.write((json.dumps(event, ensure_ascii=False) + "\n").encode())
+                self.wfile.flush()
+            except OSError:
+                # A closed page must not interrupt a running Compose operation.
+                pass
+
+        try:
+            result = sync_local_project(data, lambda phase, percent, message: send_event({
+                "type": "progress", "phase": phase, "percent": percent, "message": message,
+            }))
+            send_event({"type": "result", **result})
+        except ComposeReplacementRequired as exc:
+            send_event({"type": "error", "error": str(exc), "replaceProjects": exc.projects})
+        except (TopologyError, OSError, subprocess.SubprocessError) as exc:
+            send_event({"type": "error", "error": str(exc)})
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
@@ -720,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, (STATIC / filename).read_bytes(), mime)
 
     def do_POST(self) -> None:
-        if self.path not in ("/api/preview", "/api/download", "/api/local/select", "/api/local/sync"):
+        if self.path not in ("/api/preview", "/api/download", "/api/local/select", "/api/local/sync", "/api/local/sync/stream"):
             self.send_error(404)
             return
         try:
@@ -731,33 +869,11 @@ class Handler(BaseHTTPRequestHandler):
             if length < 1 or length > 1_000_000:
                 raise TopologyError("请求内容过大或为空")
             data = json.loads(self.rfile.read(length))
+            if self.path == "/api/local/sync/stream":
+                self.stream_local_sync(data)
+                return
             if self.path == "/api/local/sync":
-                if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not isinstance(data.get("autoRun"), bool):
-                    raise TopologyError("本地同步请求无效")
-                replacements = data.get("replaceProjects", [])
-                if not isinstance(replacements, list) or any(not isinstance(name, str) or not PROJECT_NAME_PATTERN.fullmatch(name) for name in replacements):
-                    raise TopologyError("旧项目确认信息无效")
-                with LOCAL_PROJECTS_LOCK:
-                    project = LOCAL_PROJECTS.get(data["token"])
-                if project is None:
-                    raise TopologyError("文件夹关联已失效，请重新选择")
-                files, _ = build_files(data.get("topology"))
-                has_router = any(node["type"] == "router" for node in normalize(data["topology"])[0])
-                with project["lock"]:
-                    directory = project["directory"]
-                    entries = project_entries(files, has_router)
-                    for name in entries:
-                        safe_project_target(directory, name)
-                    changed = [name for name, contents in entries.items() if write_project_file(directory, name, contents)]
-                    previous = project.get("deployed_compose") or project.get("existing_compose")
-                    should_run = data["autoRun"] and (bool(changed) or previous != files["compose.yaml"] or not project.get("deployed"))
-                    output = ""
-                    if should_run:
-                        output = run_compose(directory, previous, previous != files["compose.yaml"], set(replacements))
-                        project["deployed_compose"] = files["compose.yaml"]
-                        project["deployed"] = True
-                        project.pop("existing_compose", None)
-                    body = json.dumps({"changed": changed, "ran": should_run, "output": output}, ensure_ascii=False).encode()
+                body = json.dumps(sync_local_project(data), ensure_ascii=False).encode()
                 self.send_bytes(200, body, "application/json; charset=utf-8")
                 return
             files, warnings = build_files(data)

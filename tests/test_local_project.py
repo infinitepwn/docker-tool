@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import tempfile
 import threading
@@ -25,6 +26,70 @@ def sample(name="my_lab"):
 
 
 class LocalProjectTests(unittest.TestCase):
+    def test_compose_progress_streams_before_command_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            token = None
+            release = threading.Event()
+            try:
+                def fake_compose(directory, previous, changed, approved, progress=None):
+                    self.assertIsNotNone(progress)
+                    progress("build", 35, "#1 [client-1 1/4] RUN apt-get update")
+                    self.assertTrue(release.wait(3), "the client did not receive build progress promptly")
+                    progress("done", 100, "构建并启动完成")
+                    return "started"
+
+                with patch("app.choose_local_directory", return_value=Path(temporary)), patch("app.run_compose", side_effect=fake_compose):
+                    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                    connection.request("POST", "/api/local/select", json.dumps(sample()).encode(), {"Content-Type": "application/json"})
+                    selected = json.loads(connection.getresponse().read())
+                    token = selected["token"]
+                    connection.close()
+
+                    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                    payload = {"token": token, "topology": sample(), "autoRun": True}
+                    connection.request("POST", "/api/local/sync/stream", json.dumps(payload).encode(), {"Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    events = []
+                    while True:
+                        event = json.loads(response.readline())
+                        events.append(event)
+                        if event.get("phase") == "build":
+                            break
+                    self.assertIn("apt-get update", events[-1]["message"])
+                    release.set()
+                    rest = [json.loads(line) for line in response if line.strip()]
+                    self.assertTrue(any(event["type"] == "result" and event["ran"] for event in rest))
+                    connection.close()
+            finally:
+                release.set()
+                if token:
+                    LOCAL_PROJECTS.pop(token, None)
+                server.shutdown()
+                server.server_close()
+
+    def test_buildkit_steps_update_progress(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "compose.yaml").write_text("name: progress_lab\nservices: {}\n")
+            updates = []
+            calls = []
+
+            def fake_process(args, **kwargs):
+                calls.append(args)
+                output = "#1 [1/2] FROM ubuntu:24.04\n#1 DONE 0.1s\n#2 [2/2] RUN apt-get update\n#2 DONE 0.2s\n" if args[-1] == "build" else "Container client-1 Started\n"
+                return SimpleNamespace(stdout=io.StringIO(output), wait=lambda: 0, kill=lambda: None)
+
+            with patch("app.shutil.which", return_value="/usr/local/bin/docker"), patch("app.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="[]", stderr="")), patch("app.subprocess.Popen", side_effect=fake_process):
+                run_compose(root, None, False, progress=lambda *event: updates.append(event))
+            self.assertEqual(calls[0][-1], "build")
+            self.assertIn("--progress", calls[0])
+            self.assertTrue(any(phase == "build" and percent > 15 for phase, percent, _ in updates))
+            self.assertEqual(updates[-1][:2], ("done", 100))
+
     def test_editable_compose_name(self):
         files, _ = build_files(sample("custom_network_1"))
         self.assertTrue(files["compose.yaml"].startswith("name: custom_network_1\n"))

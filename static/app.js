@@ -516,6 +516,65 @@ async function writeDirectoryFile(root, path, contents) {
 function localStatus(message, error = false) {
   const element = $('#localStatus'); element.textContent = message; element.title = message; element.classList.toggle('error', error);
 }
+const COMPOSE_PHASES = {write:'写入项目文件', check:'检查现有项目', build:'构建镜像', down:'更新旧项目', up:'启动容器', done:'完成'};
+let composeLogLines = [];
+function beginComposeProgress() {
+  const panel = $('#composeProgress'); panel.hidden = false; panel.classList.remove('error');
+  composeLogLines = []; $('#composeProgressLog').textContent = '';
+  updateComposeProgress({phase:'write', percent:0, message:'正在准备项目文件…'});
+}
+function updateComposeProgress(event) {
+  const panel = $('#composeProgress');
+  panel.hidden = false; panel.dataset.phase = event.phase;
+  const percent = Math.max(0, Math.min(100, Number(event.percent) || 0));
+  $('#composeProgressTitle').textContent = COMPOSE_PHASES[event.phase] || '正在处理';
+  $('#composeProgressPercent').textContent = event.phase === 'done' ? '100%' : `约 ${percent}%`;
+  $('#composeProgressBar').value = percent;
+  $('#composeProgressMessage').textContent = event.message || '';
+  if (event.message && ['build','down','up'].includes(event.phase)) {
+    composeLogLines.push(event.message);
+    if (composeLogLines.length > 80) composeLogLines.shift();
+    $('#composeProgressLog').textContent = composeLogLines.join('\n');
+  }
+}
+function failComposeProgress(message) {
+  const panel = $('#composeProgress');
+  panel.hidden = false; panel.classList.add('error');
+  $('#composeProgressTitle').textContent = '构建或启动失败';
+  $('#composeProgressMessage').textContent = message;
+  panel.querySelector('details').open = true;
+}
+async function streamLocalSync(payload) {
+  const response = await fetch('/api/local/sync/stream', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+  if (!response.ok) {
+    let details = {}; try { details = await response.json(); } catch (_) {}
+    throw new Error(details.error || `请求失败 (${response.status})`);
+  }
+  if (!response.body) throw new Error('浏览器无法读取构建进度');
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let pending = '', result = null;
+  function receive(line) {
+    if (!line) return;
+    const event = JSON.parse(line);
+    if (event.type === 'progress') updateComposeProgress(event);
+    else if (event.type === 'result') result = event;
+    else if (event.type === 'error') {
+      const error = new Error(event.error || 'Docker Compose 执行失败');
+      error.replaceProjects = event.replaceProjects;
+      throw error;
+    }
+  }
+  for (;;) {
+    const {value, done} = await reader.read();
+    pending += decoder.decode(value, {stream:!done});
+    const lines = pending.split('\n'); pending = lines.pop();
+    for (const line of lines) receive(line);
+    if (done) break;
+  }
+  receive(pending);
+  if (!result) throw new Error('构建进度连接提前结束');
+  return result;
+}
 function directoryStore(operation, value) {
   if (!('indexedDB' in window)) return Promise.resolve(null);
   return new Promise((resolve, reject) => {
@@ -539,6 +598,7 @@ function setLinkedDirectory(directory) {
   $('#disconnectLocalBtn').hidden = !directory;
   $('#autoComposeInput').disabled = !directory || directory.mode !== 'native';
   if (!directory || directory.mode !== 'native') $('#autoComposeInput').checked = false;
+  if (!directory) $('#composeProgress').hidden = true;
   if (directory?.mode === 'native') sessionStorage.setItem('topology-local-directory', JSON.stringify({token:directory.token, name:directory.name}));
   else sessionStorage.removeItem('topology-local-directory');
   if (!directory || directory.mode === 'native') directoryStore('delete').catch(() => {});
@@ -582,20 +642,24 @@ async function performLocalSync() {
   const directory = linkedDirectory, currentRevision = revision;
   const snapshot = JSON.parse(JSON.stringify(topology));
   const autoRun = directory.mode === 'native' && $('#autoComposeInput').checked;
+  if (autoRun) beginComposeProgress(); else $('#composeProgress').hidden = true;
   localStatus(autoRun ? `正在写入「${directory.name}」并构建启动…` : `正在同步「${directory.name}」…`);
   try {
     let result;
     if (directory.mode === 'native') {
       const payload = {token:directory.token, topology:snapshot, autoRun};
-      try { result = await (await postJson('/api/local/sync', payload)).json(); }
+      try { result = autoRun ? await streamLocalSync(payload) : await (await postJson('/api/local/sync', payload)).json(); }
       catch (error) {
         if (!Array.isArray(error.replaceProjects) || !error.replaceProjects.length) throw error;
+        updateComposeProgress({phase:'check', percent:12, message:'等待确认替换旧项目…'});
         if (!confirm(`同一文件夹中仍有旧项目正在运行：${error.replaceProjects.join('、')}。\n\n要启动当前项目，需要停止并删除这些旧容器；容器内未持久化的修改会丢失。确认替换？`)) throw new Error('已保留旧项目；生成文件已更新，当前项目未启动');
-        result = await (await postJson('/api/local/sync', {...payload, replaceProjects:error.replaceProjects})).json();
+        beginComposeProgress();
+        result = autoRun ? await streamLocalSync({...payload, replaceProjects:error.replaceProjects}) : await (await postJson('/api/local/sync', {...payload, replaceProjects:error.replaceProjects})).json();
       }
     } else result = await browserSync(directory.handle, snapshot);
     if (linkedDirectory !== directory) return;
     localStatus(`已同步「${directory.name}」${result.ran ? ' · Compose 已构建并启动' : result.changed.length ? ` · 更新 ${result.changed.length} 个文件` : ' · 文件已是最新'}`);
+    if (autoRun && !result.ran) $('#composeProgress').hidden = true;
     if (currentRevision === revision) {
       const fresh = await (await postJson('/api/preview', snapshot)).json();
       if (currentRevision === revision && linkedDirectory === directory) showGenerated(fresh);
@@ -603,6 +667,7 @@ async function performLocalSync() {
   } catch (error) {
     if (linkedDirectory === directory) {
       localStatus(`同步失败：${error.message}`, true); toast(error.message);
+      if (autoRun) failComposeProgress(error.message);
       if (error.message.includes('关联已失效')) setLinkedDirectory(null);
     }
   } finally {
