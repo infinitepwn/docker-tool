@@ -37,7 +37,7 @@
         <section class="canvas-panel">
           <div class="canvas-toolbar"><div class="canvas-label"><span class="live-dot"></span> 拓扑画布 <span class="canvas-count" id="counts"></span></div><div class="canvas-tools"><button id="connectBtn" title="连接节点">◇ <span>连接节点</span></button><span class="tool-separator"></span><button id="zoomOut" title="缩小" aria-label="缩小画布">−</button><span id="zoomLabel">100%</span><button id="zoomIn" title="放大" aria-label="放大画布">＋</button><button id="fitBtn" title="居中" aria-label="居中显示拓扑">⊙</button></div></div>
           <div class="canvas-viewport" id="viewport"><div class="canvas-world" id="world"><svg class="edge-layer" id="edges" width="2400" height="1600" viewBox="0 0 2400 1600"></svg><div class="node-layer" id="nodes"></div></div><div class="canvas-hint" id="canvasHint">拖动节点布局 · 点击节点侧边的连接点创建连线</div></div>
-          <div class="canvas-footer"><span><i class="legend-dot client"></i>客户端</span><span><i class="legend-dot router"></i>路由器</span><span><i class="legend-dot server"></i>服务器</span><span><i class="legend-dot switch"></i>交换机</span><span class="footer-right">交换机下的所有设备共享同一个 Docker bridge 网段</span></div>
+          <div class="canvas-footer"><span><i class="legend-dot client"></i>客户端</span><span><i class="legend-dot router"></i>路由器</span><span><i class="legend-dot server"></i>服务器</span><span><i class="legend-dot switch"></i>交换机</span><span class="footer-right">交换机下的设备共享二层网络，可使用不同 IP 网段</span></div>
         </section>
 
         <aside class="inspector"><div class="inspector-title"><span>属性面板</span><button id="deleteBtn" class="icon-button danger" title="删除所选元素" aria-label="删除所选元素" disabled>⌫</button></div><div id="inspectorBody"></div></aside>

@@ -90,11 +90,20 @@ def dns_name(value: str, zone: str | None = None) -> str:
 
 
 def dns_records(config: object) -> tuple[str, list[tuple[str, str, str]]]:
-    if (not isinstance(config, dict) or set(config) != {"zone", "records"}
+    if (not isinstance(config, dict) or not {"zone", "records"} <= set(config)
+            or set(config) - {"zone", "records", "recursion", "forwardZones"}
             or not isinstance(config["zone"], str) or not isinstance(config["records"], str)
+            or not isinstance(config.get("recursion", False), bool)
+            or not isinstance(config.get("forwardZones", ""), str)
             or len(config["records"]) > 16000):
         raise TopologyError("DNS 服务器配置无效")
+    if not config["zone"].strip():
+        if config.get("recursion", False) and not config["records"].strip():
+            dns_forward_zones(config, "")
+            return "", []
+        raise TopologyError("DNS 权威区域不能为空；纯递归服务器不能配置区域记录")
     zone = dns_name(config["zone"].strip())
+    dns_forward_zones(config, zone)
     records = []
     for number, line in enumerate(config["records"].splitlines(), 1):
         if not line.strip():
@@ -131,6 +140,35 @@ def dns_records(config: object) -> tuple[str, list[tuple[str, str, str]]]:
     return zone, records
 
 
+def dns_forward_zones(config: dict, authoritative_zone: str) -> list[tuple[str, str]]:
+    """Validate domain-specific forwarding rules, even while recursion is disabled."""
+    raw = config.get("forwardZones", "")
+    if not isinstance(raw, str) or len(raw) > 16000:
+        raise TopologyError("DNS 条件转发配置无效")
+    rules = []
+    seen = set()
+    for number, line in enumerate(raw.splitlines(), 1):
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise TopologyError(f"DNS 条件转发第 {number} 行格式无效，请使用 域名 IPv4")
+        domain = dns_name(fields[0])
+        if domain == authoritative_zone or domain in seen:
+            raise TopologyError(f"DNS 条件转发域名重复或与权威区域冲突：{domain}")
+        try:
+            address = ipaddress.ip_address(fields[1])
+            if not isinstance(address, ipaddress.IPv4Address):
+                raise ValueError
+        except ValueError:
+            raise TopologyError(f"DNS 条件转发第 {number} 行需要 IPv4 地址") from None
+        rules.append((domain, str(address)))
+        seen.add(domain)
+        if len(rules) > 100:
+            raise TopologyError("DNS 条件转发最多支持 100 条")
+    return rules
+
+
 def topology_segments(nodes: list[dict], links: list[dict]) -> list[dict]:
     """Map logical switches (including switch-to-switch trunks) to L2 bridges.
 
@@ -159,9 +197,7 @@ def topology_segments(nodes: list[dict], links: list[dict]) -> list[dict]:
         source, target = link["source"], link["target"]
         switches = [x for x in (source, target) if kinds[x] == "switch"]
         key = "sw_" + root(switches[0]) if switches else "link_" + link["id"]
-        segment = segments.setdefault(key, {"key": key, "links": [], "subnet": link["subnet"], "members": {}})
-        if segment["subnet"] != link["subnet"]:
-            raise TopologyError(f"同一交换机网络的网段不一致：{segment['subnet']} 与 {link['subnet']}")
+        segment = segments.setdefault(key, {"key": key, "links": [], "subnets": [], "members": {}})
         segment["links"].append(link)
         for side in ("source", "target"):
             member = link[side]
@@ -169,7 +205,12 @@ def topology_segments(nodes: list[dict], links: list[dict]) -> list[dict]:
                 continue
             if member in segment["members"]:
                 raise TopologyError(f"节点 {member} 重复连接同一个交换机网段，请只保留一个端口")
-            segment["members"][member] = {"ip": link[side + "Ip"], "mac": link[side + "Mac"]}
+            segment["members"][member] = {"ip": link[side + "Ip"], "mac": link[side + "Mac"], "subnet": link["subnet"]}
+            if link["subnet"] not in segment["subnets"]:
+                segment["subnets"].append(link["subnet"])
+    for segment in segments.values():
+        # Preserve the legacy key for consumers of single-subnet segments.
+        segment["subnet"] = segment["subnets"][0] if segment["subnets"] else ""
     return list(segments.values())
 
 
@@ -198,6 +239,13 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
         if not isinstance(gui, bool) or (kind in ("router", "switch") and gui):
             raise TopologyError(f"节点 {node_id} 的 GUI 配置无效")
         node = {"id": node_id, "type": kind, "name": name.strip(), "gui": gui}
+        web_server = raw.get("webServer", "apache")
+        if kind == "server":
+            if not isinstance(web_server, str) or web_server not in ("apache", "nginx"):
+                raise TopologyError(f"节点 {node_id} 的 Web 服务器配置无效")
+            node["webServer"] = web_server
+        elif "webServer" in raw:
+            raise TopologyError(f"节点 {node_id} 只有服务器可以配置 Web 服务")
         resolver = raw.get("dnsResolver", "")
         if not isinstance(resolver, str):
             raise TopologyError(f"节点 {node_id} 的 DNS 解析器必须是 IPv4 地址")
@@ -215,6 +263,10 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
                 raise TopologyError(f"节点 {node_id} 只有服务器可以启用 DNS 服务")
             dns_records(dns_server)
             node["dnsServer"] = {"zone": dns_server["zone"].strip(), "records": dns_server["records"].strip()}
+            if "recursion" in dns_server:
+                node["dnsServer"]["recursion"] = dns_server["recursion"]
+            if "forwardZones" in dns_server:
+                node["dnsServer"]["forwardZones"] = dns_server["forwardZones"].strip()
         mirror = raw.get("mirror")
         if mirror is not None:
             if (kind != "router" or not isinstance(mirror, dict)
@@ -289,12 +341,13 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
     segments = topology_segments(clean_nodes, clean_links)
     used_networks = []
     for segment in segments:
-        network = ipaddress.ip_network(segment["subnet"])
-        if any(network.overlaps(other) for other in used_networks):
-            raise TopologyError(f"不同二层网段不能重叠：{segment['subnet']}")
-        used_networks.append(network)
         if not segment["members"]:
-            raise TopologyError(f"交换机网段 {segment['subnet']} 没有连接任何主机或路由器")
+            raise TopologyError("交换机网络没有连接任何主机或路由器")
+        for subnet in segment["subnets"]:
+            network = ipaddress.ip_network(subnet)
+            if any(network.overlaps(other) for other in used_networks):
+                raise TopologyError(f"不同 IP 网段不能重叠：{subnet}")
+            used_networks.append(network)
     for node in clean_nodes:
         mirror = node.get("mirror")
         if not mirror:
@@ -319,51 +372,54 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
 
 
 def route_commands(nodes: list[dict], links: list[dict]) -> tuple[dict[str, list[str]], list[str]]:
-    """Use router-only transit over shared L2 segments for static routes."""
+    """Find router-only paths; sharing a bridge does not imply sharing a subnet."""
     kinds = {node["id"]: node["type"] for node in nodes}
     segments = topology_segments(nodes, links)
-    members_to_segments = {node["id"]: [] for node in nodes if node["type"] != "switch"}
+    memberships = {node["id"]: [] for node in nodes if node["type"] != "switch"}
     for segment in segments:
-        for member in segment["members"]:
-            members_to_segments[member].append(segment)
-
-    commands: dict[str, list[str]] = {}
-    warnings = []
+        for member, interface in segment["members"].items():
+            memberships[member].append((segment, interface))
+    all_subnets = [subnet for segment in segments for subnet in segment["subnets"]]
+    commands, warnings = {}, []
     for node in nodes:
         source = node["id"]
         if node["type"] == "switch":
             continue
-        direct = {seg["key"] for seg in members_to_segments[source]}
+        direct = {interface["subnet"] for _, interface in memberships[source]}
         queue = deque()
         seen = {source}
-        for seg in members_to_segments[source]:
-            for neighbor, interface in seg["members"].items():
-                if kinds[neighbor] == "router" and neighbor not in seen:
+        for segment, local in memberships[source]:
+            for neighbor, interface in segment["members"].items():
+                if (kinds[neighbor] == "router" and neighbor not in seen
+                        and interface["subnet"] == local["subnet"]):
                     seen.add(neighbor)
-                    queue.append((neighbor, interface["ip"]))
-        reachable: dict[str, str] = {}
+                    queue.append((neighbor, interface["ip"], local["ip"], len(segment["subnets"]) > 1))
+        reachable = {}
         while queue:
-            router, first_hop = queue.popleft()
-            for seg in members_to_segments[router]:
-                if seg["key"] not in direct:
-                    reachable.setdefault(seg["key"], first_hop)
-                for neighbor in seg["members"]:
-                    if kinds[neighbor] == "router" and neighbor not in seen:
+            router, first_hop, source_ip, mixed = queue.popleft()
+            for segment, local in memberships[router]:
+                reachable.setdefault(local["subnet"], (first_hop, source_ip, mixed))
+                for neighbor, interface in segment["members"].items():
+                    if (kinds[neighbor] == "router" and neighbor not in seen
+                            and interface["subnet"] == local["subnet"]):
                         seen.add(neighbor)
-                        queue.append((neighbor, first_hop))
+                        queue.append((neighbor, first_hop, source_ip, mixed))
         commands[source] = []
-        for seg in segments:
-            if seg["key"] in direct:
+        for subnet in all_subnets:
+            if subnet in direct:
                 continue
-            hop = reachable.get(seg["key"])
-            if hop:
-                commands[source].append(f"ip route replace {seg['subnet']} via {hop}")
+            route = reachable.get(subnet)
+            if route:
+                hop, source_ip, mixed = route
+                # The auxiliary Docker address must never become the source of lab traffic.
+                suffix = f" src {source_ip}" if mixed else ""
+                commands[source].append(f"ip route replace {subnet} via {hop}{suffix}")
             else:
-                warnings.append(f"「{node['name']}」无法通过路由器到达 {seg['subnet']}")
+                warnings.append(f"「{node['name']}」无法通过路由器到达 {subnet}")
     return commands, warnings
 
 
-def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
+def dockerfile(kind: str, gui: bool = False, dns_server: bool = False, web_server: str = "apache") -> str:
     if kind == "router":
         return ("FROM scratch\n"
                 f"ADD {OPENWRT_BUNDLE_PATH} /\n"
@@ -374,7 +430,7 @@ def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
                     "tcpdump net-tools netcat-openbsd hping3 nmap openssh-client inetutils-telnet inetutils-ftp "
                     "less nano vim")
         if kind == "server":
-            packages += " apache2 openssh-server vsftpd busybox-static"
+            packages += f" {'apache2' if web_server == 'apache' else 'nginx'} openssh-server vsftpd busybox-static"
             if dns_server:
                 packages += " bind9 bind9-utils"
         install_steps = [
@@ -389,9 +445,12 @@ def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
                 "mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d",
                 "printf '%s\\n' 'PasswordAuthentication yes' 'PermitRootLogin no' > /etc/ssh/sshd_config.d/topology.conf",
                 "printf '%s\\n' 'listen=YES' 'listen_ipv6=NO' 'background=YES' 'anonymous_enable=NO' 'local_enable=YES' 'write_enable=YES' 'local_umask=022' 'chroot_local_user=YES' 'allow_writeable_chroot=YES' 'pam_service_name=vsftpd' 'secure_chroot_dir=/var/run/vsftpd/empty' 'pasv_enable=YES' 'pasv_min_port=30000' 'pasv_max_port=30009' 'seccomp_sandbox=NO' > /etc/vsftpd.conf",
-                "printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf",
-                "a2enconf topology-server-name",
             ])
+            if web_server == "apache":
+                install_steps.extend([
+                    "printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf",
+                    "a2enconf topology-server-name",
+                ])
         install_steps.append("rm -rf /var/lib/apt/lists/*")
         install_command = " \\\n    && ".join(install_steps)
         expose = "EXPOSE 21 22 23 80 30000-30009\n" if kind == "server" else ""
@@ -406,7 +465,7 @@ def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
                 "curl wget tcpdump net-tools netcat-openbsd hping3 nmap openssh-client inetutils-telnet "
                 "inetutils-ftp python3 python3-scapy")
     if kind == "server":
-        packages += " apache2 openssh-server vsftpd busybox-static"
+        packages += f" {'apache2' if web_server == 'apache' else 'nginx'} openssh-server vsftpd busybox-static"
         if dns_server:
             packages += " bind9 bind9-utils"
     server_setup = (
@@ -414,9 +473,9 @@ def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
         "&& mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d "
         "&& printf '%s\\n' 'PasswordAuthentication yes' 'PermitRootLogin no' > /etc/ssh/sshd_config.d/topology.conf "
         "&& printf '%s\\n' 'listen=YES' 'listen_ipv6=NO' 'background=YES' 'anonymous_enable=NO' 'local_enable=YES' 'write_enable=YES' 'local_umask=022' 'chroot_local_user=YES' 'allow_writeable_chroot=YES' 'pam_service_name=vsftpd' 'secure_chroot_dir=/var/run/vsftpd/empty' 'pasv_enable=YES' 'pasv_min_port=30000' 'pasv_max_port=30009' 'seccomp_sandbox=NO' > /etc/vsftpd.conf "
-        "&& printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf "
-        "&& a2enconf topology-server-name\n"
-        "EXPOSE 21 22 23 80 30000-30009\n" if kind == "server" else "")
+        + ("&& printf '%s\\n' 'ServerName localhost' > /etc/apache2/conf-available/topology-server-name.conf "
+           "&& a2enconf topology-server-name" if web_server == "apache" else "")
+        + "\nEXPOSE 21 22 23 80 30000-30009\n" if kind == "server" else "")
     return ("FROM ubuntu:24.04\n"
             "ENV DEBIAN_FRONTEND=noninteractive\n"
             f"RUN apt-get update && apt-get install -y --no-install-recommends {packages} "
@@ -464,6 +523,22 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             raise TopologyError(f"容器名称重复：{node['name']} 与 {container_names[key]} 都映射为 {container_name}，请修改节点名称")
         container_names[key] = node["name"]
     segments = topology_segments(nodes, links)
+    # Docker's bridge driver supports one IPv4 pool per network. For a bridge
+    # carrying several experiment subnets, reserve a separate Docker pool and
+    # add the actual lab addresses inside the containers at startup.
+    occupied = [ipaddress.ip_network(subnet) for segment in segments for subnet in segment["subnets"]]
+    candidate_pools = list(ipaddress.ip_network("198.18.0.0/15").subnets(new_prefix=24))
+    for segment in segments:
+        if len(segment["subnets"]) == 1:
+            segment["bridge_subnet"] = segment["subnet"]
+            continue
+        offset = int(hashlib.sha256((project_name + segment["key"]).encode()).hexdigest(), 16) % len(candidate_pools)
+        available = (candidate_pools[(offset + i) % len(candidate_pools)] for i in range(len(candidate_pools)))
+        pool = next((candidate for candidate in available if not any(candidate.overlaps(other) for other in occupied)), None)
+        if pool is None:
+            raise TopologyError("无法为多网段交换机分配不重叠的 Docker 辅助地址池")
+        segment["bridge_subnet"] = str(pool)
+        occupied.append(pool)
     commands, warnings = route_commands(nodes, links)
     mirror_receivers = {node["mirror"]["destination"] for node in nodes if node.get("mirror")}
     attachments = {node["id"]: [] for node in nodes if node["type"] != "switch"}
@@ -478,43 +553,63 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         node_id, kind, gui = node["id"], node["type"], node["gui"]
         if kind == "switch":
             continue  # One bridge per L2 domain; no pretend switch container.
-        node_dockerfile = dockerfile(kind, gui, bool(node.get("dnsServer")))
+        node_dockerfile = dockerfile(kind, gui, bool(node.get("dnsServer")), node.get("webServer", "apache"))
         if node.get("dnsServer"):
             zone, records = dns_records(node["dnsServer"])
             listen_ip = attachments[node_id][0][1]["ip"]
-            # Choose an unused in-zone nameserver name, avoiding user records and
-            # respecting the DNS maximum name length even for very long zones.
-            used_names = {name for name, _, _ in records}
-            labels = ["ns"] + [f"ns{i}" for i in range(101)] + list("abcdefghijklmnopqrstuvwxyz0123456789")
-            ns_name = next((f"{label}.{zone}" for label in labels
-                            if len(label) + 1 + len(zone) <= 253
-                            and f"{label}.{zone}" not in used_names), zone)
-            contact = f"hostmaster.{zone}" if len(zone) <= 242 else zone
-            zone_lines = ["$TTL 300", f"@ IN SOA {ns_name}. {contact}. (",
-                          "    1 3600 600 604800 300", ")", f"@ IN NS {ns_name}."]
-            if ns_name != zone or zone not in used_names:
-                zone_lines.append(f"{ns_name}. IN A {listen_ip}")
-            zone_lines.extend(f"{name}. IN {record_type} {value + '.' if record_type == 'CNAME' else value}"
-                              for name, record_type, value in records)
             dns_dir = f"dns/{node_id}"
             files[f"{dns_dir}/named.conf"] = ('include "/etc/bind/named.conf.options";\n'
                                                 'include "/etc/bind/named.conf.local";\n')
+            listen_addresses = " ".join(f"{interface['ip']};" for _, interface in attachments[node_id])
+            recursion = node["dnsServer"].get("recursion", False)
+            # Include routed lab segments, not just the DNS server's directly attached networks.
+            acl = " ".join(f"{subnet};" for segment in segments for subnet in segment["subnets"])
+            forwards = dns_forward_zones(node["dnsServer"], zone) if recursion else []
+            recursion_options = (f'    recursion yes;\n    allow-recursion {{ localhost; {acl} }};\n'
+                                 f'    allow-query-cache {{ localhost; {acl} }};\n'
+                                 if recursion else '    recursion no;\n')
+            dnssec_options = '    dnssec-validation auto;\n' if recursion else '    dnssec-validation no;\n'
+            if forwards:
+                exceptions = " ".join(f'"{domain}";' for domain, _ in forwards)
+                dnssec_options += f'    validate-except {{ {exceptions} }};\n'
             files[f"{dns_dir}/named.conf.options"] = (
                 'options {\n    directory "/var/cache/bind";\n'
-                f'    listen-on {{ 127.0.0.1; {listen_ip}; }};\n'
+                f'    listen-on {{ 127.0.0.1; {listen_addresses} }};\n'
                 '    listen-on-v6 { none; };\n    allow-query { any; };\n'
-                '    recursion no;\n    dnssec-validation no;\n};\n')
-            files[f"{dns_dir}/named.conf.local"] = (
-                f'zone "{zone}" {{\n    type master;\n'
-                '    file "/etc/bind/db.topology";\n};\n')
-            files[f"{dns_dir}/db.zone"] = "\n".join(zone_lines) + "\n"
+                f'{recursion_options}{dnssec_options}}};\n')
+            files[f"{dns_dir}/named.conf.local"] = ""
+            if zone:
+                # Choose an unused in-zone nameserver name within DNS length limits.
+                used_names = {name for name, _, _ in records}
+                labels = ["ns"] + [f"ns{i}" for i in range(101)] + list("abcdefghijklmnopqrstuvwxyz0123456789")
+                ns_name = next((f"{label}.{zone}" for label in labels
+                                if len(label) + 1 + len(zone) <= 253
+                                and f"{label}.{zone}" not in used_names), zone)
+                contact = f"hostmaster.{zone}" if len(zone) <= 242 else zone
+                zone_lines = ["$TTL 300", f"@ IN SOA {ns_name}. {contact}. (",
+                              "    1 3600 600 604800 300", ")", f"@ IN NS {ns_name}."]
+                if ns_name != zone or zone not in used_names:
+                    zone_lines.append(f"{ns_name}. IN A {listen_ip}")
+                zone_lines.extend(f"{name}. IN {record_type} {value + '.' if record_type == 'CNAME' else value}"
+                                  for name, record_type, value in records)
+                files[f"{dns_dir}/named.conf.local"] = (
+                    f'zone "{zone}" {{\n    type master;\n'
+                    '    file "/etc/bind/db.topology";\n};\n')
+                files[f"{dns_dir}/db.zone"] = "\n".join(zone_lines) + "\n"
+            for domain, address in forwards:
+                files[f"{dns_dir}/named.conf.local"] += (
+                    f'zone "{domain}" {{\n    type forward;\n    forward only;\n'
+                    f'    forwarders {{ {address}; }};\n}};\n')
             if gui:
                 node_dockerfile += "USER root\n"
             node_dockerfile += (f"COPY {dns_dir}/named.conf {dns_dir}/named.conf.options "
-                                f"{dns_dir}/named.conf.local /etc/bind/\n"
-                                f"COPY {dns_dir}/db.zone /etc/bind/db.topology\n"
-                                f"RUN named-checkconf -z && named-checkzone {zone} /etc/bind/db.topology\n"
-                                "EXPOSE 53/udp 53/tcp\n")
+                                f"{dns_dir}/named.conf.local /etc/bind/\n")
+            if zone:
+                node_dockerfile += (f"COPY {dns_dir}/db.zone /etc/bind/db.topology\n"
+                                    f"RUN named-checkconf -z && named-checkzone {zone} /etc/bind/db.topology\n")
+            else:
+                node_dockerfile += "RUN named-checkconf -z\n"
+            node_dockerfile += "EXPOSE 53/udp 53/tcp\n"
             if gui:
                 node_dockerfile += "USER 1000\n"
         mirror = node.get("mirror")
@@ -573,7 +668,24 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"1\""])
         elif node_id in mirror_receivers:
             lines.extend(["    sysctls:", "      net.ipv4.ip_forward: \"0\""])
-        startup = list(commands[node_id])
+        startup = []
+        for key, interface in attachments[node_id]:
+            segment = next(item for item in segments if item["key"] == key)
+            if len(segment["subnets"]) > 1:
+                prefix = ipaddress.ip_network(interface["subnet"]).prefixlen
+                # Compose interpolates dollars before passing the command to sh.
+                startup.append(
+                    '(dev=; for p in /sys/class/net/*; do '
+                    f'if [ "$$(cat "$$p/address")" = "{interface["mac"]}" ]; then '
+                    'dev="$${p##*/}"; break; fi; done; '
+                    'test -n "$$dev" && '
+                    'pool=$$(ip -4 route show dev "$$dev" scope link | sed -n "1s/ .*//p") && '
+                    'test -n "$$pool" && gateway="$${pool%.*}.1" && '
+                    f'ip address add {interface["ip"]}/{prefix} dev "$$dev" && '
+                    'ip route replace blackhole "$$pool" && '
+                    'ip route replace "$$gateway/32" dev "$$dev")'
+                )
+        startup.extend(commands[node_id])
         if mirror:
             startup.append("nft -f /etc/topology-mirror.nft")
         if kind == "server":
@@ -589,7 +701,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
                 startup.extend(["mkdir -p /run/named", "chown bind:bind /run/named",
                                 "/usr/sbin/named -4 -u bind -c /etc/bind/named.conf"])
         if gui:
-            hook = startup + (["apache2ctl start"] if kind == "server" else [])
+            hook = startup + (["apache2ctl start" if node["webServer"] == "apache" else "/usr/sbin/nginx"] if kind == "server" else [])
             if hook:
                 lines.extend([
                     "    post_start:",
@@ -597,15 +709,15 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
                     "        user: root",
                 ])
         else:
-            startup += ["exec apache2ctl -D FOREGROUND"] if kind == "server" else ["tail -f /dev/null"]
+            startup += (["exec apache2ctl -D FOREGROUND" if node["webServer"] == "apache" else "exec /usr/sbin/nginx -g 'daemon off;'"] if kind == "server" else ["tail -f /dev/null"])
             lines.append(f"    command: [\"sh\", \"-c\", {yaml_string(' && '.join(startup))}]")
         lines.append("    networks:")
         for key, interface in attachments[node_id]:
-            lines.extend([
-                f"      net_{key}:",
-                f"        ipv4_address: {interface['ip']}",
-                f"        mac_address: {interface['mac']}",
-            ])
+            lines.append(f"      net_{key}:")
+            segment = next(item for item in segments if item["key"] == key)
+            if len(segment["subnets"]) == 1:
+                lines.append(f"        ipv4_address: {interface['ip']}")
+            lines.append(f"        mac_address: {interface['mac']}")
     lines.append("networks:")
     for segment in segments:
         lines.extend([
@@ -615,7 +727,7 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
             "      com.docker.network.bridge.enable_ip_masquerade: \"false\"",
             "    ipam:",
             "      config:",
-            f"        - subnet: {segment['subnet']}",
+            f"        - subnet: {segment['bridge_subnet']}",
         ])
     files["compose.yaml"] = "\n".join(lines) + "\n"
     environment = []
@@ -630,10 +742,11 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         suffix = "，GUI" if node["gui"] else ""
         detail = "（Docker bridge 虚拟二层交换机，不创建容器）" if node["type"] == "switch" else ""
         readme.append(f"- `{node['id']}`: {node['name']} ({node['type']}{suffix}){detail}" + (f"; container=`{node_container_name(node)}`, hostname=`{node_hostname(node)}`" if node["type"] != "switch" else ""))
-    readme.extend(["", "Every physical node container runs with `privileged: true`, allowing full container capabilities and device access for lab modifications. Switch nodes are Docker bridges and do not create containers.", "Changes made only inside a running container are lost when that container is rebuilt; put persistent changes in its Dockerfile or a mounted volume.", "Client/server images include Bash and common Linux tools such as ping, SSH, Telnet, FTP and netcat (`nc`); interactive Bash displays `root@hostname:~#`. Enter non-GUI containers with `docker exec -it <container-name> bash`.", "Every server node runs Apache HTTP Server on container port 80; access it from the topology with `http://<server-ip>/`. Apache's document root is `/var/www/html`.", "Every server also runs OpenSSH on port 22, BusyBox Telnet on port 23 and vsftpd on port 21. Sign in as `lab` with `SERVER_PASSWORD` from `.env`. FTP passive mode uses ports 30000–30009 inside the topology network.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "All attached physical containers share the same subnet and can communicate without a router.", "Switch ports have no IP or MAC; the bridge's first host IP is reserved for the Docker gateway.", ""])
+    readme.extend(["", "Every physical node container runs with `privileged: true`, allowing full container capabilities and device access for lab modifications. Switch nodes are Docker bridges and do not create containers.", "Changes made only inside a running container are lost when that container is rebuilt; put persistent changes in its Dockerfile or a mounted volume.", "Client/server images include Bash and common Linux tools such as ping, SSH, Telnet, FTP and netcat (`nc`); interactive Bash displays `root@hostname:~#`. Enter non-GUI containers with `docker exec -it <container-name> bash`.", "Every server runs the selected Apache or Nginx HTTP server on container port 80; access it from the topology with `http://<server-ip>/`. The default document root is `/var/www/html`.", "Every server also runs OpenSSH on port 22, BusyBox Telnet on port 23 and vsftpd on port 21. Sign in as `lab` with `SERVER_PASSWORD` from `.env`. FTP passive mode uses ports 30000–30009 inside the topology network.", "For DNS-safe ASCII node names, the hostname matches the visible name; names containing Chinese, spaces or invalid hostname characters use the node ID as hostname. The container name uses the visible node name where Docker-safe; invalid characters are replaced by hyphens and names consisting entirely of non-ASCII characters fall back to the node ID. The original visible name is kept in the `topology.name` label.", "OpenWrt router images retain the shells supplied by their rootfs (usually `sh`).", "", "## Layer-2 networks", "", "Each switch-connected domain (including interconnected switches) maps to one Docker bridge.", "IP masquerading is disabled on every generated bridge, so packets leaving a bridge retain the container source address; external networks need an explicit return route.", "A switch is a Layer-2 domain and may carry several distinct IP subnets. Hosts in different subnets need a router and routes to communicate.", "Switch ports have no IP or MAC. The first host IP of each lab subnet is reserved for Docker compatibility.", "A bridge with multiple lab subnets uses an additional Docker-managed 198.18.0.0/15 address pool; its container addresses are retained for Docker networking and published ports, while lab IPs and their configured masks are added at startup. The pool does not overlap this topology's lab subnets. Direct traffic to auxiliary container addresses is blocked to preserve IP subnet isolation, although Docker's built-in DNS may return those addresses for container names; use the lab IP addresses for experiments. The Docker gateway remains reachable. If the pool conflicts with an existing Docker network on the host, change its subnet in compose.yaml to an unused /24 that does not overlap any lab subnet, then recreate the network.", ""])
     for segment in segments:
-        participants = ", ".join(f"{node_id}={iface['ip']}" for node_id, iface in segment["members"].items())
-        readme.append(f"- `net_{segment['key']}` `{segment['subnet']}`: {participants}")
+        participants = ", ".join(f"{node_id}={iface['ip']}/{ipaddress.ip_network(iface['subnet']).prefixlen}" for node_id, iface in segment["members"].items())
+        subnets = ", ".join(segment["subnets"])
+        readme.append(f"- `net_{segment['key']}` subnets `{subnets}` (Docker pool `{segment['bridge_subnet']}`): {participants}")
     readme.extend(["", "## Links", ""])
     kinds = {node["id"]: node["type"] for node in nodes}
     for link in links:
@@ -643,14 +756,18 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
     if gui_ports:
         readme.extend(["", "## GUI access", "", f"Open the following local HTTPS URLs after starting Compose. Sign in as `{GUI_USERNAME}`; the password is `VNC_PW` in `.env`.", ""])
         readme.extend(f"- `{node_id}`: https://localhost:{port}" for node_id, port in gui_ports.items())
-        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "They include ping, ip, curl, wget, SSH, Telnet, FTP, netcat (`nc`), traceroute, tcpdump, nmap and common terminal editors.", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also runs Apache, OpenSSH, Telnet and vsftpd."])
+        readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "They include ping, ip, curl, wget, SSH, Telnet, FTP, netcat (`nc`), traceroute, tcpdump, nmap and common terminal editors.", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "A GUI server also runs its selected web server, OpenSSH, Telnet and vsftpd."])
     if server_nodes:
-        readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- Telnet: `telnet <server-ip> 23`", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
+        readme.extend(["", "## Server access", "", "Web server by node:", ""])
+        readme.extend(f"- `{node['id']}`: {'Apache' if node['webServer'] == 'apache' else 'Nginx'}" for node in server_nodes)
+        readme.extend(["", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- Telnet: `telnet <server-ip> 23`", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
     dns_nodes = [node for node in nodes if node.get("dnsServer")]
     if dns_nodes:
-        readme.extend(["", "## DNS experiments", "", "Configured BIND9 servers are authoritative for their generated zones and answer on UDP and TCP port 53; recursion is disabled by default. Query one explicitly with `dig @<server-ip> <name> A` or `dig +tcp @<server-ip> <name> A`. A client using a configured resolver can also use `dig <name>`; it must be able to route to that resolver.", "", "Edit `named.conf.options`, `named.conf.local` and `db.zone` in the generated DNS directory before rebuilding, or edit their copies under `/etc/bind` in the running container and reload BIND. Validate changes with `named-checkconf` and `named-checkzone <zone> /etc/bind/db.topology`. Changes made only inside a container are lost when it is rebuilt.", ""])
+        readme.extend(["", "## DNS experiments", "", "BIND9 answers on UDP and TCP port 53. A server may be authoritative for its configured zone, recursive, or both; recursion is disabled by default. Query one explicitly with `dig @<server-ip> <name> A` or `dig +tcp @<server-ip> <name> A`. A client using a configured resolver can also use `dig <name>`; it must be able to route to that resolver.", "", "Recursive servers use BIND's built-in root hints; recursion and cached answers are restricted to localhost and the generated lab subnets. DNSSEC validation is enabled for recursive queries except explicitly forwarded zones, allowing unsigned private zones. Queries outside local or conditionally forwarded zones need a route to root and authoritative servers, UDP and TCP port 53 access, and a return route to the lab subnet. The generated bridges disable masquerading and do not automatically provide Internet access. Separate private authoritative zones are not discovered automatically: configure delegation or a conditional forward for each private zone. Conditional forwards affect only the configured domains; other domains still use root hints.", "", "Edit `named.conf.options`, `named.conf.local` and, for an authoritative server, `db.zone` in the generated DNS directory before rebuilding, or edit their copies under `/etc/bind` in the running container and reload BIND. Validate changes with `named-checkconf` and `named-checkzone <zone> /etc/bind/db.topology` for configured zones. Changes made only inside a container are lost when it is rebuilt.", ""])
         for node in dns_nodes:
-            readme.append(f"- `{node['id']}`: zone `{node['dnsServer']['zone']}`, address `{attachments[node['id']][0][1]['ip']}`, configuration `dns/{node['id']}/`.")
+            zone = node['dnsServer']['zone'] or '(none)'
+            recursion = 'enabled' if node['dnsServer'].get('recursion', False) else 'disabled'
+            readme.append(f"- `{node['id']}`: zone `{zone}`, recursion {recursion}, address `{attachments[node['id']][0][1]['ip']}`, configuration `dns/{node['id']}/`.")
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     mirrors = [node for node in nodes if node.get("mirror")]

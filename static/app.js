@@ -11,6 +11,7 @@ const SERVER_USERNAME = 'lab';
 const TYPE_LABEL = { client: '客户端', router: '路由器', server: '服务器', switch: '交换机' };
 const TYPE_ICON = { client: '⌘', router: '◇', server: '▣', switch: '▦' };
 const NODE_W = 154, NODE_H = 100;
+const PROJECT_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 let topology = loadTopology();
 let selection = null;
 let pendingSource = null;
@@ -26,7 +27,6 @@ let syncInFlight = false;
 let syncPending = false;
 let revision = 0;
 let nativePickerAvailable = false;
-const PROJECT_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 
 function randomPassword() {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
@@ -111,13 +111,23 @@ function validateTopologyDocument(document) {
     const x = Number.isFinite(Number(raw.x)) ? Number(raw.x) : 120 + index * 35;
     const y = Number.isFinite(Number(raw.y)) ? Number(raw.y) : 160 + index * 25;
     const node = {id:raw.id, name:typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : raw.id, type:raw.type, gui:(raw.type === 'client' || raw.type === 'server') && raw.gui === true, x:Math.max(0, Math.min(2240, x)), y:Math.max(0, Math.min(1520, y))};
+    if (raw.webServer !== undefined) {
+      if (raw.type !== 'server' || !['apache', 'nginx'].includes(raw.webServer)) throw new Error(`第 ${index + 1} 个节点的 Web 服务器配置无效`);
+      node.webServer = raw.webServer;
+    }
     if (raw.dnsResolver !== undefined && raw.dnsResolver !== '') {
       if (!['client','server'].includes(raw.type) || typeof raw.dnsResolver !== 'string' || raw.dnsResolver.length > 15) throw new Error(`第 ${index + 1} 个节点的 DNS 服务器地址无效`);
       node.dnsResolver = raw.dnsResolver;
     }
     if (raw.dnsServer !== undefined && raw.dnsServer !== null) {
       if (raw.type !== 'server' || typeof raw.dnsServer !== 'object' || typeof raw.dnsServer.zone !== 'string' || typeof raw.dnsServer.records !== 'string' || raw.dnsServer.zone.length > 253 || raw.dnsServer.records.length > 16000) throw new Error(`第 ${index + 1} 个节点的 DNS 服务配置无效`);
+      if (raw.dnsServer.recursion !== undefined && typeof raw.dnsServer.recursion !== 'boolean') throw new Error(`第 ${index + 1} 个节点的 DNS 递归设置无效`);
       node.dnsServer = {zone:raw.dnsServer.zone, records:raw.dnsServer.records};
+      if (raw.dnsServer.recursion !== undefined) node.dnsServer.recursion = raw.dnsServer.recursion;
+      if (raw.dnsServer.forwardZones !== undefined) {
+        if (typeof raw.dnsServer.forwardZones !== 'string' || raw.dnsServer.forwardZones.length > 16000) throw new Error(`第 ${index + 1} 个节点的 DNS 条件转发配置无效`);
+        node.dnsServer.forwardZones = raw.dnsServer.forwardZones;
+      }
     }
     if (raw.mirror !== undefined && raw.mirror !== null) {
       if (raw.type !== 'router' || !raw.mirror || typeof raw.mirror !== 'object' || ['source','target','destination'].some(field => typeof raw.mirror[field] !== 'string')) throw new Error(`第 ${index + 1} 个节点的流量镜像配置无效`);
@@ -274,7 +284,10 @@ function nodeKind(id) { return nodeById(id)?.type; }
     if (switchA || switchB) {
       const first = switchA ? groupForSwitch(a) : [];
       const second = switchB ? groupForSwitch(b) : [];
-      subnet = first[0]?.subnet || second[0]?.subnet || newSubnet();
+      // Prefer an attached device's subnet, since switch-to-switch links do
+      // not represent an IP interface and can have a stale subnet value.
+      const attached = [...first, ...second].find(l => nodeKind(l.source) !== 'switch' || nodeKind(l.target) !== 'switch');
+      subnet = attached?.subnet || first[0]?.subnet || second[0]?.subnet || newSubnet();
       if (switchA && !switchB && first.some(l => l.source===b || l.target===b) ||
           switchB && !switchA && second.some(l => l.source===a || l.target===a)) throw new Error('该设备已连接到同一个交换机网段，不能重复接入');
       if (switchA && switchB && switchFamily(a).has(b)) throw new Error('这两台交换机已经处于同一个二层网段');
@@ -286,12 +299,7 @@ function nodeKind(id) { return nodeById(id)?.type; }
       result[side+'Mac'] = newMac([result.sourceMac, result.targetMac]);
     }
     topology.links.push(result);
-    if (switchA && switchB) {
-      const ids = groupLinkIds(result);
-      const ranges = new Set([...ids].map(id => topology.links.find(l => l.id===id).subnet));
-      if (ranges.size > 1) readdress(ids, subnet);
-    }
-    selection = {kind:'link', id:result.id}; save(); stopConnecting(); render(); toast(`已连接：${subnet}`);
+    selection = {kind:'link', id:result.id}; save(); stopConnecting(); render(); toast(switchA && switchB ? '已连接交换机' : `已连接：${subnet}`);
   }
 
 function newLink(source, target) {
@@ -316,7 +324,7 @@ function addNode(type, x, y) {
   selection = { kind: 'node', id }; save(); render();
 }
 function nodeIps(node) {
-  if (node.type === 'switch') { const links = groupForSwitch(node.id); return links.length ? [links[0].subnet] : ['二层交换机 · 无 IP']; }
+  if (node.type === 'switch') return ['二层交换机 · 无 IP'];
   const ips = [];
   for (const link of topology.links) {
     if (link.source === node.id && link.sourceIp) ips.push(link.sourceIp);
@@ -361,7 +369,7 @@ function renderEdges() {
     hit.addEventListener('pointerdown', event => { event.stopPropagation(); selection = { kind: 'link', id: link.id }; render(); });
     const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
     label.setAttribute('x', (x1 + x2) / 2); label.setAttribute('y', (y1 + y2) / 2 - 10);
-    label.setAttribute('text-anchor', 'middle'); label.setAttribute('class', 'edge-label'); label.textContent = link.subnet;
+    label.setAttribute('text-anchor', 'middle'); label.setAttribute('class', 'edge-label'); label.textContent = a.type === 'switch' && b.type === 'switch' ? '二层连接' : link.subnet;
     group.append(visible, hit, label); edgeLayer.appendChild(group);
   }
 }
@@ -387,7 +395,7 @@ function mirrorControls(node) {
 }
 function dnsControls(node) {
   if (!['client','server'].includes(node.type)) return '';
-  const server = node.type === 'server' ? `<label class="gui-option"><input type="checkbox" data-dns-enable ${node.dnsServer ? 'checked' : ''}><span><strong>启用 BIND9 DNS 服务</strong><small>提供实验区域的权威解析</small></span></label>${node.dnsServer ? `<label class="form-field"><span>区域名称</span><input data-dns-field="zone" value="${esc(node.dnsServer.zone)}" placeholder="example.test" spellcheck="false"></label><label class="form-field"><span>DNS 记录（每行一条）</span><textarea data-dns-field="records" rows="5" spellcheck="false" placeholder="www A 192.168.2.11&#10;alias CNAME www.example.test.">${esc(node.dnsServer.records)}</textarea></label><div class="form-help">格式：名称 A IPv4，或名称 CNAME 目标。名称可用 @ 表示区域本身；CNAME 目标需指向本区域中的 A 记录，可填写相对名称或完整域名。默认关闭递归和外部查询。</div>` : ''}` : '';
+  const server = node.type === 'server' ? `<label class="gui-option"><input type="checkbox" data-dns-enable ${node.dnsServer ? 'checked' : ''}><span><strong>启用 BIND9 DNS 服务</strong><small>配置权威区域或递归解析</small></span></label>${node.dnsServer ? `<label class="gui-option"><input type="checkbox" data-dns-recursion ${node.dnsServer.recursion ? 'checked' : ''}><span><strong>启用递归解析</strong><small>从根服务器逐级查询；需要外部网络可达</small></span></label>${node.dnsServer.recursion ? `<label class="form-field"><span>实验域名转发（可选，每行一条）</span><textarea data-dns-field="forwardZones" rows="3" spellcheck="false" placeholder="example.test 10.200.2.11">${esc(node.dnsServer.forwardZones || '')}</textarea></label><div class="form-help">格式：域名 权威服务器 IPv4。匹配的查询发往指定服务器，其他域名从根服务器逐级查询。</div>` : ''}<label class="form-field"><span>权威区域名称（纯递归可留空）</span><input data-dns-field="zone" value="${esc(node.dnsServer.zone)}" placeholder="example.test" spellcheck="false"></label><label class="form-field"><span>DNS 记录（每行一条）</span><textarea data-dns-field="records" rows="5" spellcheck="false" placeholder="www A 192.168.2.11&#10;alias CNAME www.example.test.">${esc(node.dnsServer.records)}</textarea></label><div class="form-help">格式：名称 A IPv4，或名称 CNAME 目标。名称可用 @ 表示区域本身；CNAME 目标需指向本区域中的 A 记录，可填写相对名称或完整域名。仅启用递归时，可将区域和记录都留空。</div>` : ''}` : '';
   return `<div class="inspector-divider"></div><div class="endpoint-title">DNS 实验 <small>使用 dig 或 nslookup 查询记录</small></div>${server}<label class="form-field"><span>本节点使用的 DNS 服务器 IPv4（可选）</span><input data-dns-resolver value="${esc(node.dnsResolver || '')}" placeholder="例如 10.200.2.11" spellcheck="false"></label><div class="form-help">填写可达的 DNS 服务器地址；留空使用 Docker 默认解析。Docker 自定义网络可能通过内置 DNS 转发查询。</div>`;
 }
 function renderInspector() {
@@ -398,15 +406,21 @@ function renderInspector() {
     const node = nodeById(selection.id);
     if (!node) { selection = null; renderInspector(); return; }
     const connected = topology.links.filter(l => l.source === node.id || l.target === node.id);
-    const guiControls = node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机：同交换机网段的设备共享 Docker bridge，不需要配置 IP。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>Kasm Ubuntu 桌面，预装常用网络工具</small></span></label>${node.gui ? `<div class="gui-credentials"><div class="credential-title">GUI 登录信息</div><div class="credential-row"><span>地址</span><code>https://localhost:${guiPort(node.id)}</code></div><div class="credential-row"><span>用户名</span><code>${GUI_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.guiPassword)}</code></div><button type="button" data-copy-gui>复制登录信息</button><small>内置 ping、ip、curl、wget、SSH、Telnet、FTP、Netcat、traceroute、tcpdump、nmap 等工具。执行 <code>sudo -i</code> 可免密进入 root。</small></div>` : ''}`;
+    const guiControls = node.type === 'router' ? '<div class="form-help">自动使用随项目打包的 OpenWrt ARM64 rootfs。</div>' : node.type === 'switch' ? '<div class="form-help">虚拟二层交换机不需要配置 IP；连接到同一交换机的设备可以使用不同网段。</div>' : `<label class="gui-option"><input type="checkbox" data-node-field="gui" ${node.gui ? 'checked' : ''}><span><strong>需要 GUI 桌面</strong><small>Kasm Ubuntu 桌面，预装常用网络工具</small></span></label>${node.gui ? `<div class="gui-credentials"><div class="credential-title">GUI 登录信息</div><div class="credential-row"><span>地址</span><code>https://localhost:${guiPort(node.id)}</code></div><div class="credential-row"><span>用户名</span><code>${GUI_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.guiPassword)}</code></div><button type="button" data-copy-gui>复制登录信息</button><small>内置 ping、ip、curl、wget、SSH、Telnet、FTP、Netcat、traceroute、tcpdump、nmap 等工具。执行 <code>sudo -i</code> 可免密进入 root。</small></div>` : ''}`;
     const serverIp = nodeIps(node)[0] || '<服务器IP>';
-    const serverControls = node.type === 'server' ? `<div class="gui-credentials"><div class="credential-title">服务器登录信息</div><div class="credential-row"><span>用户名</span><code>${SERVER_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.serverPassword)}</code></div><div class="credential-row"><span>SSH</span><code>ssh ${SERVER_USERNAME}@${esc(serverIp)}</code></div><div class="credential-row"><span>Telnet</span><code>telnet ${esc(serverIp)} 23</code></div><div class="credential-row"><span>FTP</span><code>ftp ${esc(serverIp)}</code></div><div class="credential-row"><span>HTTP</span><code>http://${esc(serverIp)}/</code></div><button type="button" data-copy-server>复制服务器信息</button><small>SSH 使用 22 端口，Telnet 使用 23 端口，FTP 使用 21 端口和被动端口 30000–30009，Apache 使用 80 端口。密码会写入生成项目的 .env。</small></div>` : '';
-    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}${serverControls}${dnsControls(node)}${mirrorControls(node)}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
+    const webServer = node.webServer === 'nginx' ? 'Nginx' : 'Apache';
+    const serverControls = node.type === 'server' ? `<label class="form-field"><span>Web 服务器</span><select data-web-server><option value="apache" ${webServer === 'Apache' ? 'selected' : ''}>Apache</option><option value="nginx" ${webServer === 'Nginx' ? 'selected' : ''}>Nginx</option></select></label><div class="gui-credentials"><div class="credential-title">服务器登录信息</div><div class="credential-row"><span>用户名</span><code>${SERVER_USERNAME}</code></div><div class="credential-row"><span>密码</span><code>${esc(topology.serverPassword)}</code></div><div class="credential-row"><span>SSH</span><code>ssh ${SERVER_USERNAME}@${esc(serverIp)}</code></div><div class="credential-row"><span>Telnet</span><code>telnet ${esc(serverIp)} 23</code></div><div class="credential-row"><span>FTP</span><code>ftp ${esc(serverIp)}</code></div><div class="credential-row"><span>HTTP</span><code>http://${esc(serverIp)}/</code></div><button type="button" data-copy-server>复制服务器信息</button><small>SSH 使用 22 端口，Telnet 使用 23 端口，FTP 使用 21 端口和被动端口 30000–30009，${webServer} 使用 80 端口。密码会写入生成项目的 .env。</small></div>` : '';
+    body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">NODE / ${esc(node.id)}</div><div class="inspector-heading">${esc(node.name)}</div><label class="form-field"><span>节点名称</span><input data-node-field="name" maxlength="60" value="${esc(node.name)}"></label><label class="form-field"><span>节点类型</span><select data-node-field="type">${Object.keys(TYPE_LABEL).map(type => `<option value="${type}" ${node.type === type ? 'selected' : ''}>${TYPE_LABEL[type]}</option>`).join('')}</select></label>${guiControls}${serverControls}${dnsControls(node)}${mirrorControls(node)}<div class="form-help">客户端、服务器可连接一条线；路由器、交换机可连接多个设备。</div><div class="inspector-divider"></div><div class="endpoint-title">连接接口 <small>${connected.length} 个网络接口</small></div>${connected.map(l => `<div class="form-help" style="margin:0 0 9px">${esc(nodeKind(l.source) === 'switch' && nodeKind(l.target) === 'switch' ? '二层连接' : l.subnet)} · ${esc(node.type === 'switch' ? '二层交换端口' : (l.source === node.id ? l.sourceIp : l.targetIp))}</div>`).join('') || '<div class="form-help">尚无连接。点击节点右侧圆点开始连接。</div>'}</div>`;
     body.querySelector('[data-node-field="name"]').addEventListener('input', event => { node.name = event.target.value; save(); renderNodes(); });
-    body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; if (node.type !== 'router') delete node.mirror; if (node.type !== 'server') delete node.dnsServer; if (!['client','server'].includes(node.type)) delete node.dnsResolver; for (const item of topology.nodes) if (item.mirror && Object.values(item.mirror).includes(node.id) && !['client','server'].includes(node.type)) delete item.mirror; save(); render(); });
+    body.querySelector('[data-node-field="type"]').addEventListener('change', event => { if (!['router','switch'].includes(event.target.value) && degree(node.id) > 1) { toast('多连接节点必须保持为路由器或交换机'); event.target.value = node.type; return; } node.type = event.target.value; if (['router','switch'].includes(node.type)) node.gui = false; if (node.type !== 'router') delete node.mirror; if (node.type !== 'server') { delete node.dnsServer; delete node.webServer; } if (!['client','server'].includes(node.type)) delete node.dnsResolver; for (const item of topology.nodes) if (item.mirror && Object.values(item.mirror).includes(node.id) && !['client','server'].includes(node.type)) delete item.mirror; save(); render(); });
+    body.querySelector('[data-web-server]')?.addEventListener('change', event => { node.webServer = event.target.value; save(); renderInspector(); });
     body.querySelector('[data-dns-enable]')?.addEventListener('change', event => {
       if (event.target.checked) node.dnsServer = {zone:'example.test', records:''};
       else delete node.dnsServer;
+      save(); renderInspector();
+    });
+    body.querySelector('[data-dns-recursion]')?.addEventListener('change', event => {
+      node.dnsServer.recursion = event.target.checked;
       save(); renderInspector();
     });
     body.querySelector('[data-dns-resolver]')?.addEventListener('input', event => {
@@ -451,15 +465,16 @@ function renderInspector() {
   const link = topology.links.find(l => l.id === selection.id);
   if (!link) { selection = null; renderInspector(); return; }
   const a = nodeById(link.source), b = nodeById(link.target);
-  const group = groupLinkIds(link);
-  const isShared = group.size > 1;
-  body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">LINK / ${esc(link.id)}</div><div class="inspector-heading">${esc(a.name)} ↔ ${esc(b.name)}</div><label class="form-field"><span>网络网段 CIDR</span><input data-link-field="subnet" value="${esc(link.subnet)}" spellcheck="false"></label><div class="form-help">${isShared ? '交换机连接共享一个 Docker bridge 网段。修改网段会同步调整同网段接口。' : '直连链路对应独立的 Docker bridge 网络。'}</div><div class="inspector-divider"></div>${['source','target'].map((side, i) => {
+  const switchLink = a.type === 'switch' || b.type === 'switch';
+  const switchToSwitch = a.type === 'switch' && b.type === 'switch';
+  const subnetControls = switchToSwitch ? '<div class="form-help">交换机之间为二层连接，不需要配置 IP 网段。</div>' : `<label class="form-field"><span>网络网段 CIDR</span><input data-link-field="subnet" value="${esc(link.subnet)}" spellcheck="false"></label><div class="form-help">${switchLink ? '修改此接口的网段不会改变其他设备的地址。不同网段可以共用二层网络，但默认需要路由器才能互相通信。' : '直连链路对应独立的网络；修改网段会重新分配两端地址。'}</div>`;
+  body.innerHTML = `<div class="inspector-body"><div class="inspector-kicker">LINK / ${esc(link.id)}</div><div class="inspector-heading">${esc(a.name)} ↔ ${esc(b.name)}</div>${subnetControls}<div class="inspector-divider"></div>${['source','target'].map((side, i) => {
     const node = i ? b : a;
     return `<div class="endpoint-title">${esc(node.name)} <small>${i ? '目标接口' : '源接口'}</small></div>${node.type === 'switch' ? '<div class="form-help">二层交换机端口（无 IP/MAC）</div>' : `<label class="form-field"><span>IPv4 地址</span><input data-link-field="${side}Ip" value="${esc(link[side + 'Ip'])}" spellcheck="false"></label><label class="form-field"><span>MAC 地址</span><input data-link-field="${side}Mac" value="${esc(link[side + 'Mac'])}" spellcheck="false"></label>`}${i ? '' : '<div class="inspector-divider"></div>'}`;
   }).join('')}</div>`;
   body.querySelectorAll('[data-link-field]').forEach(input => input.addEventListener('change', event => {
     const field = event.target.dataset.linkField;
-    try { if (field === 'subnet') readdress(groupLinkIds(link), event.target.value.trim()); else link[field] = event.target.value.trim(); save(); render(); }
+    try { if (field === 'subnet') readdress(new Set([link.id]), event.target.value.trim()); else link[field] = event.target.value.trim(); save(); render(); }
     catch (error) { toast(error.message); renderInspector(); }
   }));
 }
