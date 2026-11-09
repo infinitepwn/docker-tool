@@ -72,6 +72,63 @@ def node_container_name(node: dict) -> str:
     return name[:128].rstrip("_.-")
 
 
+def dns_name(value: str, zone: str | None = None) -> str:
+    """Validate a DNS name and expand names relative to the experiment zone."""
+    absolute = value.endswith(".")
+    name = value[:-1] if absolute else value
+    if zone and name == "@":
+        name = zone
+    elif zone and not (name.lower() == zone or name.lower().endswith("." + zone)):
+        if absolute:
+            raise TopologyError("DNS 记录名称和 CNAME 目标必须位于实验区域内")
+        name += "." + zone
+    name = name.lower()
+    if (not name or len(name) > 253 or
+            any(not HOSTNAME_PATTERN.fullmatch(label) for label in name.split("."))):
+        raise TopologyError(f"DNS 域名无效：{value}")
+    return name
+
+
+def dns_records(config: object) -> tuple[str, list[tuple[str, str, str]]]:
+    if (not isinstance(config, dict) or set(config) != {"zone", "records"}
+            or not isinstance(config["zone"], str) or not isinstance(config["records"], str)
+            or len(config["records"]) > 16000):
+        raise TopologyError("DNS 服务器配置无效")
+    zone = dns_name(config["zone"].strip())
+    records = []
+    for number, line in enumerate(config["records"].splitlines(), 1):
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 3 or fields[1].upper() not in ("A", "CNAME"):
+            raise TopologyError(f"DNS 第 {number} 行格式无效，请使用 名称 A IPv4 或 名称 CNAME 目标")
+        name = dns_name(fields[0], zone)
+        record_type = fields[1].upper()
+        if record_type == "A":
+            try:
+                address = ipaddress.ip_address(fields[2])
+                if not isinstance(address, ipaddress.IPv4Address):
+                    raise ValueError
+            except ValueError:
+                raise TopologyError(f"DNS 第 {number} 行的 A 记录需要 IPv4 地址") from None
+            value = str(address)
+        else:
+            value = dns_name(fields[2], zone)
+        records.append((name, record_type, value))
+        if len(records) > 100:
+            raise TopologyError("DNS 记录最多支持 100 条")
+    a_names = {name for name, record_type, _ in records if record_type == "A"}
+    cname_names = set()
+    for name, record_type, value in records:
+        if record_type == "CNAME":
+            if name in a_names or name in cname_names:
+                raise TopologyError(f"DNS CNAME 名称重复或与 A 记录冲突：{name}")
+            if value not in a_names:
+                raise TopologyError(f"DNS CNAME 目标必须是本区域已有的 A 记录：{value}")
+            cname_names.add(name)
+    return zone, records
+
+
 def topology_segments(nodes: list[dict], links: list[dict]) -> list[dict]:
     """Map logical switches (including switch-to-switch trunks) to L2 bridges.
 
@@ -139,6 +196,23 @@ def normalize(data: object) -> tuple[list[dict], list[dict]]:
         if not isinstance(gui, bool) or (kind in ("router", "switch") and gui):
             raise TopologyError(f"节点 {node_id} 的 GUI 配置无效")
         node = {"id": node_id, "type": kind, "name": name.strip(), "gui": gui}
+        resolver = raw.get("dnsResolver", "")
+        if not isinstance(resolver, str):
+            raise TopologyError(f"节点 {node_id} 的 DNS 解析器必须是 IPv4 地址")
+        if resolver.strip():
+            try:
+                address = ipaddress.ip_address(resolver.strip())
+                if kind not in ("client", "server") or not isinstance(address, ipaddress.IPv4Address):
+                    raise ValueError
+            except ValueError:
+                raise TopologyError(f"节点 {node_id} 的 DNS 解析器必须是客户端或服务器的 IPv4 地址") from None
+            node["dnsResolver"] = str(address)
+        dns_server = raw.get("dnsServer")
+        if dns_server is not None:
+            if kind != "server":
+                raise TopologyError(f"节点 {node_id} 只有服务器可以启用 DNS 服务")
+            dns_records(dns_server)
+            node["dnsServer"] = {"zone": dns_server["zone"].strip(), "records": dns_server["records"].strip()}
         mirror = raw.get("mirror")
         if mirror is not None:
             if (kind != "router" or not isinstance(mirror, dict)
@@ -287,7 +361,7 @@ def route_commands(nodes: list[dict], links: list[dict]) -> tuple[dict[str, list
     return commands, warnings
 
 
-def dockerfile(kind: str, gui: bool = False) -> str:
+def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
     if kind == "router":
         return ("FROM scratch\n"
                 f"ADD {OPENWRT_BUNDLE_PATH} /\n"
@@ -299,6 +373,8 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                     "less nano vim")
         if kind == "server":
             packages += " apache2 openssh-server vsftpd busybox-static"
+            if dns_server:
+                packages += " dnsmasq"
         install_steps = [
             "apt-get update",
             f"apt-get install -y --no-install-recommends {packages}",
@@ -329,6 +405,8 @@ def dockerfile(kind: str, gui: bool = False) -> str:
                 "inetutils-ftp python3 python3-scapy")
     if kind == "server":
         packages += " apache2 openssh-server vsftpd busybox-static"
+        if dns_server:
+            packages += " dnsmasq"
     server_setup = (
         f"RUN (id -u {SERVER_USERNAME} >/dev/null 2>&1 || useradd -m -s /bin/bash {SERVER_USERNAME}) "
         "&& mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d "
@@ -398,7 +476,16 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         node_id, kind, gui = node["id"], node["type"], node["gui"]
         if kind == "switch":
             continue  # One bridge per L2 domain; no pretend switch container.
-        node_dockerfile = dockerfile(kind, gui)
+        node_dockerfile = dockerfile(kind, gui, bool(node.get("dnsServer")))
+        if node.get("dnsServer"):
+            zone, records = dns_records(node["dnsServer"])
+            listen_ip = attachments[node_id][0][1]["ip"]
+            dns_config = ["no-resolv", "no-hosts", "bind-interfaces",
+                          f"listen-address=127.0.0.1,{listen_ip}", f"local=/{zone}/"]
+            dns_config.extend(f"{'host-record' if record_type == 'A' else 'cname'}={name},{value}"
+                              for name, record_type, value in records)
+            files[f"dns/{node_id}.conf"] = "\n".join(dns_config) + "\n"
+            node_dockerfile += f"COPY dns/{node_id}.conf /etc/topology-dnsmasq.conf\nEXPOSE 53/udp 53/tcp\n"
         mirror = node.get("mirror")
         if mirror:
             endpoint_ips = {}
@@ -434,6 +521,8 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         ])
         if kind == "router":
             lines.append("    platform: linux/arm64")
+        if node.get("dnsResolver"):
+            lines.extend(["    dns:", f"      - {yaml_string(node['dnsResolver'])}"])
         if gui:
             gui_ports[node_id] = next_gui_port
             next_gui_port += 1
@@ -465,6 +554,8 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
                 "/usr/sbin/vsftpd /etc/vsftpd.conf",
                 "/bin/busybox telnetd -p 23 -l /bin/login",
             ])
+            if node.get("dnsServer"):
+                startup.append("/usr/sbin/dnsmasq --conf-file=/etc/topology-dnsmasq.conf")
         if gui:
             hook = startup + (["apache2ctl start"] if kind == "server" else [])
             if hook:
@@ -523,6 +614,11 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         readme.extend(["", "GUI containers use Kasm's standalone desktop image and need Docker Compose with `post_start` support (v2.30+).", "They include ping, ip, curl, wget, SSH, Telnet, FTP, netcat (`nc`), traceroute, tcpdump, nmap and common terminal editors.", "The web sign-in name is `kasm_user`; the Linux desktop account is `kasm-user`. Run `sudo -i` in the desktop terminal for a passwordless root shell inside the container.", "The GUI server also runs Apache, OpenSSH, Telnet and vsftpd."])
     if server_nodes:
         readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- Telnet: `telnet <server-ip> 23`", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
+    dns_nodes = [node for node in nodes if node.get("dnsServer")]
+    if dns_nodes:
+        readme.extend(["", "## DNS experiments", "", "Configured DNS servers answer local A and CNAME records on UDP and TCP port 53 without an upstream resolver. Query one explicitly with `dig @<server-ip> <name> A` or `dig +tcp @<server-ip> <name> A`. A client using a configured resolver can also use `dig <name>`; it must be able to route to that resolver.", ""])
+        for node in dns_nodes:
+            readme.append(f"- `{node['id']}`: zone `{node['dnsServer']['zone']}`, address `{attachments[node['id']][0][1]['ip']}`, configuration `dns/{node['id']}.conf`.")
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     mirrors = [node for node in nodes if node.get("mirror")]

@@ -98,6 +98,28 @@
 
   FTP 支持本地用户读写，默认目录是 `/home/lab`，被动模式使用容器内部的 30000–30009 端口。服务仅通过拓扑网络地址访问，生成器不会把 SSH、FTP 或 HTTP 端口发布到宿主机。
 
+  ## DNS 实验
+
+  可以在服务器节点的属性面板中启用“DNS 实验服务”，设置区域名称和 DNS 记录。例如设置区域 `example.test`，逐行填写：
+
+  ```
+  www A 10.200.2.11
+  alias CNAME www.example.test.
+  ```
+
+  名称可以是区域内的相对名称、完整域名，或用 `@` 表示区域本身；CNAME 目标必须指向该区域中已有的 A 记录。服务使用 dnsmasq，仅回答实验配置的本地区域，不转发外部 DNS 查询。修改配置后需重新生成并重建容器。
+
+  在需要使用该服务的客户端或服务器节点的“本节点使用的 DNS 服务器 IPv4”中，填写 DNS 服务器的拓扑 IP。确保节点之间有可用的网络路径；留空则使用 Docker 的默认解析。Docker 自定义网络可能在 `/etc/resolv.conf` 中显示内置解析器 `127.0.0.11`，并将查询转发给配置的 DNS 服务器。
+
+  启动拓扑后，在客户端容器中验证（按实际节点名和 IP 替换）：
+
+  ```
+  docker exec -it client1 bash
+  dig @10.200.2.11 www.example.test A
+  dig @10.200.2.11 alias.example.test CNAME
+  nslookup www.example.test
+  ```
+
   ## 容器名称与交互式 Bash
 
   生成的**容器名称**优先使用拓扑画布上的节点名称，例如节点名 `attacker`、`client1`、`server`，即可直接：

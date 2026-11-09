@@ -41,6 +41,70 @@ def mirrored_topology():
 
 
 class GeneratorTests(unittest.TestCase):
+    def test_dns_server_and_resolver_generation(self):
+        data = topology()
+        data["nodes"][0]["dnsResolver"] = "10.200.3.11"
+        data["nodes"][3]["dnsServer"] = {
+            "zone": "example.test.",
+            "records": "@ A 10.200.3.11\nwww A 10.200.3.11\nalias CNAME www.example.test.",
+        }
+        files, _ = build_files(data)
+        config = files["dns/server-1.conf"]
+        self.assertIn("no-resolv\nno-hosts\n", config)
+        self.assertIn("listen-address=127.0.0.1,10.200.3.11", config)
+        self.assertIn("local=/example.test/", config)
+        self.assertIn("host-record=example.test,10.200.3.11", config)
+        self.assertIn("host-record=www.example.test,10.200.3.11", config)
+        self.assertIn("cname=alias.example.test,www.example.test", config)
+        self.assertIn("dnsmasq", files["dockerfiles/server-1.Dockerfile"])
+        self.assertIn("COPY dns/server-1.conf /etc/topology-dnsmasq.conf", files["dockerfiles/server-1.Dockerfile"])
+        self.assertNotIn("dnsmasq", files["dockerfiles/client-1.Dockerfile"])
+        self.assertIn('    dns:\n      - "10.200.3.11"', files["compose.yaml"])
+        self.assertIn("dnsmasq --conf-file=/etc/topology-dnsmasq.conf", files["compose.yaml"])
+        snapshot = json.loads(files["topology.json"])
+        self.assertEqual(snapshot["nodes"][0]["dnsResolver"], "10.200.3.11")
+        self.assertEqual(snapshot["nodes"][3]["dnsServer"], data["nodes"][3]["dnsServer"])
+        self.assertIn("dig @<server-ip>", files["README.md"])
+        self.assertIn("dns/server-1.conf", zipfile.ZipFile(io.BytesIO(make_archive(files, True))).namelist())
+
+    def test_dns_server_gui_uses_root_start_hook(self):
+        data = topology()
+        data["nodes"][3]["gui"] = True
+        data["guiPassword"] = "DesktopPass1234"
+        data["nodes"][3]["dnsServer"] = {"zone": "lab.test", "records": "www A 10.200.3.11"}
+        files, _ = build_files(data)
+        dockerfile = files["dockerfiles/server-1.Dockerfile"]
+        self.assertIn("dnsmasq", dockerfile)
+        self.assertIn("COPY dns/server-1.conf", dockerfile)
+        self.assertIn("dnsmasq --conf-file=/etc/topology-dnsmasq.conf", files["compose.yaml"])
+        self.assertIn("        user: root", files["compose.yaml"])
+
+    def test_dns_rejects_invalid_records_and_injection(self):
+        for records in ("www A 2001:db8::1", "www TXT arbitrary", "www A 1.2.3.4\nserver=8.8.8.8",
+                        "bad/name A 1.2.3.4", "alias CNAME external.example.",
+                        "alias CNAME missing", "www A 1.2.3.4\nwww CNAME www",
+                        "www A 1.2.3.4\na CNAME www\na CNAME www"):
+            with self.subTest(records=records):
+                data = topology()
+                data["nodes"][3]["dnsServer"] = {"zone": "example.test", "records": records}
+                with self.assertRaises(TopologyError):
+                    build_files(data)
+        for resolver in ("8.8.8.8\n  privileged: true", "2001:db8::1", "999.1.1.1"):
+            data = topology()
+            data["nodes"][0]["dnsResolver"] = resolver
+            with self.assertRaises(TopologyError):
+                build_files(data)
+        data = topology()
+        data["nodes"][1]["dnsServer"] = {"zone": "example.test", "records": ""}
+        with self.assertRaises(TopologyError):
+            build_files(data)
+
+    def test_legacy_topology_does_not_enable_dns_server(self):
+        files, _ = build_files(topology())
+        self.assertNotIn("dns/server-1.conf", files)
+        self.assertNotIn("dnsmasq", files["dockerfiles/server-1.Dockerfile"])
+        self.assertNotIn("    dns:", files["compose.yaml"])
+
     def test_router_mirrors_bidirectional_traffic(self):
         data = mirrored_topology()
         files, warnings = build_files(data)
