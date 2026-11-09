@@ -49,23 +49,34 @@ class GeneratorTests(unittest.TestCase):
             "records": "@ A 10.200.3.11\nwww A 10.200.3.11\nalias CNAME www.example.test.",
         }
         files, _ = build_files(data)
-        config = files["dns/server-1.conf"]
-        self.assertIn("no-resolv\nno-hosts\n", config)
-        self.assertIn("listen-address=127.0.0.1,10.200.3.11", config)
-        self.assertIn("local=/example.test/", config)
-        self.assertIn("host-record=example.test,10.200.3.11", config)
-        self.assertIn("host-record=www.example.test,10.200.3.11", config)
-        self.assertIn("cname=alias.example.test,www.example.test", config)
-        self.assertIn("dnsmasq", files["dockerfiles/server-1.Dockerfile"])
-        self.assertIn("COPY dns/server-1.conf /etc/topology-dnsmasq.conf", files["dockerfiles/server-1.Dockerfile"])
-        self.assertNotIn("dnsmasq", files["dockerfiles/client-1.Dockerfile"])
+        dns_dir = "dns/server-1/"
+        for name in ("named.conf", "named.conf.options", "named.conf.local", "db.zone"):
+            self.assertIn(dns_dir + name, files)
+        self.assertIn('named.conf.options', files[dns_dir + "named.conf"])
+        self.assertIn('named.conf.local', files[dns_dir + "named.conf"])
+        self.assertIn('recursion no;', files[dns_dir + "named.conf.options"])
+        self.assertIn('zone "example.test"', files[dns_dir + "named.conf.local"])
+        zone = files[dns_dir + "db.zone"]
+        self.assertIn('SOA', zone)
+        self.assertIn('NS', zone)
+        self.assertRegex(zone, r'example\.test\.\s+IN\s+A\s+10\.200\.3\.11')
+        self.assertRegex(zone, r'www\.example\.test\.\s+IN\s+A\s+10\.200\.3\.11')
+        self.assertRegex(zone, r'alias\.example\.test\.\s+IN\s+CNAME\s+www\.example\.test\.')
+        dockerfile = files["dockerfiles/server-1.Dockerfile"]
+        self.assertIn("bind9", dockerfile)
+        self.assertIn("/etc/bind/", dockerfile)
+        self.assertNotIn("bind9", files["dockerfiles/client-1.Dockerfile"])
         self.assertIn('    dns:\n      - "10.200.3.11"', files["compose.yaml"])
-        self.assertIn("dnsmasq --conf-file=/etc/topology-dnsmasq.conf", files["compose.yaml"])
+        self.assertIn("/usr/sbin/named", files["compose.yaml"])
+        self.assertIn("-c /etc/bind/named.conf", files["compose.yaml"])
+        self.assertNotIn("dnsmasq", "\n".join(files.values()))
         snapshot = json.loads(files["topology.json"])
         self.assertEqual(snapshot["nodes"][0]["dnsResolver"], "10.200.3.11")
         self.assertEqual(snapshot["nodes"][3]["dnsServer"], data["nodes"][3]["dnsServer"])
         self.assertIn("dig @<server-ip>", files["README.md"])
-        self.assertIn("dns/server-1.conf", zipfile.ZipFile(io.BytesIO(make_archive(files, True))).namelist())
+        archive = zipfile.ZipFile(io.BytesIO(make_archive(files, True)))
+        for name in ("named.conf", "named.conf.options", "named.conf.local", "db.zone"):
+            self.assertIn(dns_dir + name, archive.namelist())
 
     def test_dns_server_gui_uses_root_start_hook(self):
         data = topology()
@@ -74,16 +85,31 @@ class GeneratorTests(unittest.TestCase):
         data["nodes"][3]["dnsServer"] = {"zone": "lab.test", "records": "www A 10.200.3.11"}
         files, _ = build_files(data)
         dockerfile = files["dockerfiles/server-1.Dockerfile"]
-        self.assertIn("dnsmasq", dockerfile)
-        self.assertIn("COPY dns/server-1.conf", dockerfile)
-        self.assertIn("dnsmasq --conf-file=/etc/topology-dnsmasq.conf", files["compose.yaml"])
-        self.assertIn("        user: root", files["compose.yaml"])
+        self.assertIn("bind9", dockerfile)
+        self.assertIn("/etc/bind/", dockerfile)
+        server = files["compose.yaml"].split("  server-1:", 1)[1].split("\nnetworks:", 1)[0]
+        self.assertIn("post_start:", server)
+        self.assertIn("/usr/sbin/named", server)
+        self.assertIn("        user: root", server)
+
+    def test_dns_nameserver_does_not_conflict_with_user_cname(self):
+        data = topology()
+        data["nodes"][3]["dnsServer"] = {
+            "zone": "example.test",
+            "records": "www A 10.200.3.11\nns CNAME www",
+        }
+        files, _ = build_files(data)
+        zone = files["dns/server-1/db.zone"]
+        self.assertRegex(zone, r'@\s+IN\s+NS\s+ns0\.example\.test\.')
+        self.assertRegex(zone, r'ns0\.example\.test\.\s+IN\s+A\s+10\.200\.3\.11')
+        self.assertRegex(zone, r'ns\.example\.test\.\s+IN\s+CNAME\s+www\.example\.test\.')
 
     def test_dns_rejects_invalid_records_and_injection(self):
         for records in ("www A 2001:db8::1", "www TXT arbitrary", "www A 1.2.3.4\nserver=8.8.8.8",
                         "bad/name A 1.2.3.4", "alias CNAME external.example.",
                         "alias CNAME missing", "www A 1.2.3.4\nwww CNAME www",
-                        "www A 1.2.3.4\na CNAME www\na CNAME www"):
+                        "www A 1.2.3.4\na CNAME www\na CNAME www",
+                        "www A 1.2.3.4\n@ CNAME www"):
             with self.subTest(records=records):
                 data = topology()
                 data["nodes"][3]["dnsServer"] = {"zone": "example.test", "records": records}
@@ -101,8 +127,9 @@ class GeneratorTests(unittest.TestCase):
 
     def test_legacy_topology_does_not_enable_dns_server(self):
         files, _ = build_files(topology())
-        self.assertNotIn("dns/server-1.conf", files)
-        self.assertNotIn("dnsmasq", files["dockerfiles/server-1.Dockerfile"])
+        self.assertFalse(any(path.startswith("dns/") for path in files))
+        self.assertNotIn("bind9", files["dockerfiles/server-1.Dockerfile"])
+        self.assertNotIn("/usr/sbin/named", files["compose.yaml"])
         self.assertNotIn("    dns:", files["compose.yaml"])
 
     def test_router_mirrors_bidirectional_traffic(self):

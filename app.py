@@ -121,6 +121,8 @@ def dns_records(config: object) -> tuple[str, list[tuple[str, str, str]]]:
     cname_names = set()
     for name, record_type, value in records:
         if record_type == "CNAME":
+            if name == zone:
+                raise TopologyError("DNS 区域顶点不能使用 CNAME 记录，因为它必须包含 SOA 和 NS 记录")
             if name in a_names or name in cname_names:
                 raise TopologyError(f"DNS CNAME 名称重复或与 A 记录冲突：{name}")
             if value not in a_names:
@@ -374,7 +376,7 @@ def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
         if kind == "server":
             packages += " apache2 openssh-server vsftpd busybox-static"
             if dns_server:
-                packages += " dnsmasq"
+                packages += " bind9 bind9-utils"
         install_steps = [
             "apt-get update",
             f"apt-get install -y --no-install-recommends {packages}",
@@ -406,7 +408,7 @@ def dockerfile(kind: str, gui: bool = False, dns_server: bool = False) -> str:
     if kind == "server":
         packages += " apache2 openssh-server vsftpd busybox-static"
         if dns_server:
-            packages += " dnsmasq"
+            packages += " bind9 bind9-utils"
     server_setup = (
         f"RUN (id -u {SERVER_USERNAME} >/dev/null 2>&1 || useradd -m -s /bin/bash {SERVER_USERNAME}) "
         "&& mkdir -p /run/sshd /var/run/vsftpd/empty /etc/ssh/sshd_config.d "
@@ -480,12 +482,41 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         if node.get("dnsServer"):
             zone, records = dns_records(node["dnsServer"])
             listen_ip = attachments[node_id][0][1]["ip"]
-            dns_config = ["no-resolv", "no-hosts", "bind-interfaces",
-                          f"listen-address=127.0.0.1,{listen_ip}", f"local=/{zone}/"]
-            dns_config.extend(f"{'host-record' if record_type == 'A' else 'cname'}={name},{value}"
+            # Choose an unused in-zone nameserver name, avoiding user records and
+            # respecting the DNS maximum name length even for very long zones.
+            used_names = {name for name, _, _ in records}
+            labels = ["ns"] + [f"ns{i}" for i in range(101)] + list("abcdefghijklmnopqrstuvwxyz0123456789")
+            ns_name = next((f"{label}.{zone}" for label in labels
+                            if len(label) + 1 + len(zone) <= 253
+                            and f"{label}.{zone}" not in used_names), zone)
+            contact = f"hostmaster.{zone}" if len(zone) <= 242 else zone
+            zone_lines = ["$TTL 300", f"@ IN SOA {ns_name}. {contact}. (",
+                          "    1 3600 600 604800 300", ")", f"@ IN NS {ns_name}."]
+            if ns_name != zone or zone not in used_names:
+                zone_lines.append(f"{ns_name}. IN A {listen_ip}")
+            zone_lines.extend(f"{name}. IN {record_type} {value + '.' if record_type == 'CNAME' else value}"
                               for name, record_type, value in records)
-            files[f"dns/{node_id}.conf"] = "\n".join(dns_config) + "\n"
-            node_dockerfile += f"COPY dns/{node_id}.conf /etc/topology-dnsmasq.conf\nEXPOSE 53/udp 53/tcp\n"
+            dns_dir = f"dns/{node_id}"
+            files[f"{dns_dir}/named.conf"] = ('include "/etc/bind/named.conf.options";\n'
+                                                'include "/etc/bind/named.conf.local";\n')
+            files[f"{dns_dir}/named.conf.options"] = (
+                'options {\n    directory "/var/cache/bind";\n'
+                f'    listen-on {{ 127.0.0.1; {listen_ip}; }};\n'
+                '    listen-on-v6 { none; };\n    allow-query { any; };\n'
+                '    recursion no;\n    dnssec-validation no;\n};\n')
+            files[f"{dns_dir}/named.conf.local"] = (
+                f'zone "{zone}" {{\n    type master;\n'
+                '    file "/etc/bind/db.topology";\n};\n')
+            files[f"{dns_dir}/db.zone"] = "\n".join(zone_lines) + "\n"
+            if gui:
+                node_dockerfile += "USER root\n"
+            node_dockerfile += (f"COPY {dns_dir}/named.conf {dns_dir}/named.conf.options "
+                                f"{dns_dir}/named.conf.local /etc/bind/\n"
+                                f"COPY {dns_dir}/db.zone /etc/bind/db.topology\n"
+                                f"RUN named-checkconf -z && named-checkzone {zone} /etc/bind/db.topology\n"
+                                "EXPOSE 53/udp 53/tcp\n")
+            if gui:
+                node_dockerfile += "USER 1000\n"
         mirror = node.get("mirror")
         if mirror:
             endpoint_ips = {}
@@ -555,7 +586,8 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
                 "/bin/busybox telnetd -p 23 -l /bin/login",
             ])
             if node.get("dnsServer"):
-                startup.append("/usr/sbin/dnsmasq --conf-file=/etc/topology-dnsmasq.conf")
+                startup.extend(["mkdir -p /run/named", "chown bind:bind /run/named",
+                                "/usr/sbin/named -4 -u bind -c /etc/bind/named.conf"])
         if gui:
             hook = startup + (["apache2ctl start"] if kind == "server" else [])
             if hook:
@@ -616,9 +648,9 @@ def build_files(data: object) -> tuple[dict[str, str], list[str]]:
         readme.extend(["", "## Server access", "", f"All server nodes share the Linux username `{SERVER_USERNAME}` and the generated `SERVER_PASSWORD` stored in `.env`.", "", "- SSH: `ssh lab@<server-ip>` (port 22)", "- Telnet: `telnet <server-ip> 23`", "- FTP: `ftp <server-ip>` (port 21; passive ports 30000–30009)", "- HTTP: `http://<server-ip>/` (port 80)"])
     dns_nodes = [node for node in nodes if node.get("dnsServer")]
     if dns_nodes:
-        readme.extend(["", "## DNS experiments", "", "Configured DNS servers answer local A and CNAME records on UDP and TCP port 53 without an upstream resolver. Query one explicitly with `dig @<server-ip> <name> A` or `dig +tcp @<server-ip> <name> A`. A client using a configured resolver can also use `dig <name>`; it must be able to route to that resolver.", ""])
+        readme.extend(["", "## DNS experiments", "", "Configured BIND9 servers are authoritative for their generated zones and answer on UDP and TCP port 53; recursion is disabled by default. Query one explicitly with `dig @<server-ip> <name> A` or `dig +tcp @<server-ip> <name> A`. A client using a configured resolver can also use `dig <name>`; it must be able to route to that resolver.", "", "Edit `named.conf.options`, `named.conf.local` and `db.zone` in the generated DNS directory before rebuilding, or edit their copies under `/etc/bind` in the running container and reload BIND. Validate changes with `named-checkconf` and `named-checkzone <zone> /etc/bind/db.topology`. Changes made only inside a container are lost when it is rebuilt.", ""])
         for node in dns_nodes:
-            readme.append(f"- `{node['id']}`: zone `{node['dnsServer']['zone']}`, address `{attachments[node['id']][0][1]['ip']}`, configuration `dns/{node['id']}.conf`.")
+            readme.append(f"- `{node['id']}`: zone `{node['dnsServer']['zone']}`, address `{attachments[node['id']][0][1]['ip']}`, configuration `dns/{node['id']}/`.")
     if has_router:
         readme.extend(["", "## Router image", "", "Router Dockerfiles unpack the bundled OpenWrt ARM64 rootfs. Run on ARM64 or a Docker host with ARM64 emulation."])
     mirrors = [node for node in nodes if node.get("mirror")]
