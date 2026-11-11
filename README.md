@@ -2,7 +2,7 @@
 
 一个基于浏览器的 Docker 网络实验拓扑编辑器。在画布上放置客户端、服务器、路由器和交换机，配置网络和服务，然后生成可运行的 Docker Compose 项目。
 
-![拓扑工坊编辑器：画布、节点和属性面板](docs/images/topology-workspace.jpg)
+![拓扑工坊编辑器：画布、节点和属性面板](docs/images/topology-workspace-current.png)
 
 ## 功能概览
 

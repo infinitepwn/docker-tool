@@ -192,10 +192,14 @@ function guiPort(id) { return 6901 + topology.nodes.filter(node => node.gui).fin
 function canConnect(id) { const n = nodeById(id); return n && (n.type === 'router' || n.type === 'switch' || degree(id) === 0); }
 function chooseSource(id) {
   if (!canConnect(id)) { toast('客户端和服务器只能连接一条线，请通过交换机连接多个设备'); return; }
-  pendingSource = id; connectMode = true; $('#connectBtn').classList.add('active'); viewport.classList.add('connecting'); $('#canvasHint').textContent = `已选择 ${nodeById(id).name}，点击目标节点完成连接 · Esc 取消`;
+  pendingSource = id; connectMode = true; $('#connectBtn').classList.add('active'); $('#connectBtn').setAttribute('aria-pressed', 'true'); viewport.classList.add('connecting'); $('#canvasHint').textContent = `已选择 ${nodeById(id).name}，点击目标节点完成连接 · Esc 取消`;
   renderNodes();
 }
-function stopConnecting() { pendingSource = null; connectMode = false; $('#connectBtn').classList.remove('active'); viewport.classList.remove('connecting'); $('#canvasHint').textContent = '拖动节点布局 · 点击节点侧边的连接点创建连线'; renderNodes(); }
+function stopConnecting() {
+  const focusedNode = document.activeElement?.closest?.('.topology-node')?.dataset.nodeId;
+  pendingSource = null; connectMode = false; $('#connectBtn').classList.remove('active'); $('#connectBtn').setAttribute('aria-pressed', 'false'); viewport.classList.remove('connecting'); $('#canvasHint').textContent = '拖动节点布局 · 点击节点侧边的连接点创建连线'; renderNodes();
+  if (focusedNode) [...nodeLayer.children].find(item => item.dataset.nodeId === focusedNode)?.focus();
+}
 function nodeKind(id) { return nodeById(id)?.type; }
   function switchFamily(id) {
     const family = new Set([id]), todo = [id];
@@ -338,9 +342,20 @@ function renderNodes() {
     const el = document.createElement('div');
     el.className = `topology-node ${node.type}${selection?.kind === 'node' && selection.id === node.id ? ' selected' : ''}${pendingSource === node.id ? ' pending' : ''}`;
     el.style.left = `${Number(node.x) || 0}px`; el.style.top = `${Number(node.y) || 0}px`; el.dataset.nodeId = node.id;
+    el.setAttribute('role', 'button'); el.tabIndex = 0;
+    el.setAttribute('aria-label', `${node.name}，${TYPE_LABEL[node.type]}，${degree(node.id)} 条连接`);
     el.innerHTML = `<span class="node-icon">${TYPE_ICON[node.type] || '?'}</span><span class="node-copy"><strong>${esc(node.name)}</strong><span>${TYPE_LABEL[node.type] || node.type}${node.gui ? ' · GUI' : ''} · ${degree(node.id)} 条连接</span><span class="node-ips">${nodeIps(node).map(ip => `<small>${esc(ip)}</small>`).join('')}</span></span><span class="node-port" title="从此节点连接"></span>`;
     el.querySelector('.node-port').addEventListener('pointerdown', event => event.stopPropagation());
-    el.querySelector('.node-port').addEventListener('click', event => { event.stopPropagation(); if (pendingSource) newLink(pendingSource, node.id); else chooseSource(node.id); });
+    const port = el.querySelector('.node-port');
+    port.addEventListener('click', event => { event.stopPropagation(); if (pendingSource) newLink(pendingSource, node.id); else chooseSource(node.id); });
+    el.addEventListener('keydown', event => {
+      if (event.target !== el || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault(); event.stopPropagation();
+      if (pendingSource) newLink(pendingSource, node.id);
+      else if (connectMode) chooseSource(node.id);
+      else { selection = {kind:'node', id:node.id}; renderInspector(); renderNodes(); }
+      [...nodeLayer.children].find(item => item.dataset.nodeId === node.id)?.focus();
+    });
     el.addEventListener('pointerdown', event => {
       if (event.button !== 0) return;
       event.stopPropagation();
@@ -366,7 +381,16 @@ function renderEdges() {
     visible.setAttribute('x1', x1); visible.setAttribute('y1', y1); visible.setAttribute('x2', x2); visible.setAttribute('y2', y2);
     visible.setAttribute('class', `edge-visible${selection?.kind === 'link' && selection.id === link.id ? ' edge-selected' : ''}`);
     const hit = visible.cloneNode(); hit.setAttribute('class', 'edge-hit');
+    hit.setAttribute('tabindex', '0'); hit.setAttribute('role', 'button');
+    const linkDescription = a.type === 'switch' && b.type === 'switch' ? '二层连接' : link.subnet;
+    hit.setAttribute('aria-label', `${a.name} 到 ${b.name} 的连线，${linkDescription}`);
     hit.addEventListener('pointerdown', event => { event.stopPropagation(); selection = { kind: 'link', id: link.id }; render(); });
+    hit.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault(); event.stopPropagation();
+      selection = {kind:'link', id:link.id}; render();
+      [...edgeLayer.querySelectorAll('.edge-hit')][topology.links.indexOf(link)]?.focus();
+    });
     const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
     label.setAttribute('x', (x1 + x2) / 2); label.setAttribute('y', (y1 + y2) / 2 - 10);
     label.setAttribute('text-anchor', 'middle'); label.setAttribute('class', 'edge-label'); label.textContent = a.type === 'switch' && b.type === 'switch' ? '二层连接' : link.subnet;
@@ -758,7 +782,8 @@ viewport.addEventListener('pointerdown', event => { if (event.button !== 0 || ev
 viewport.addEventListener('pointermove', event => { if (!dragging) return; if (dragging.kind === 'pan') { transform.x = event.clientX - dragging.x; transform.y = event.clientY - dragging.y; renderTransform(); } else { const node = nodeById(dragging.id); if (!node) return; const p = worldPoint(event.clientX,event.clientY); node.x = Math.round(Math.max(0, Math.min(2240, p.x - dragging.dx))); node.y = Math.round(Math.max(0, Math.min(1520, p.y - dragging.dy))); const el = [...nodeLayer.children].find(item => item.dataset.nodeId === node.id); if (el) { el.style.left = `${node.x}px`; el.style.top = `${node.y}px`; } renderEdges(); } });
 viewport.addEventListener('pointerup', () => { if (dragging?.kind === 'node') { save(); renderNodes(); } dragging = null; viewport.classList.remove('panning'); });
 viewport.addEventListener('wheel', event => { if (!event.ctrlKey && !event.metaKey) return; event.preventDefault(); zoom(event.deltaY < 0 ? 1.08 : .92); }, {passive:false});
-$('#connectBtn').addEventListener('click', () => { if (connectMode) stopConnecting(); else { connectMode = true; $('#connectBtn').classList.add('active'); viewport.classList.add('connecting'); $('#canvasHint').textContent = '点击第一个节点，再点击目标节点 · Esc 取消'; } });
+$('#connectBtn').setAttribute('aria-pressed', 'false');
+$('#connectBtn').addEventListener('click', () => { if (connectMode) stopConnecting(); else { connectMode = true; $('#connectBtn').classList.add('active'); $('#connectBtn').setAttribute('aria-pressed', 'true'); viewport.classList.add('connecting'); $('#canvasHint').textContent = '点击第一个节点，再点击目标节点 · Esc 取消'; } });
 $('#zoomIn').addEventListener('click', () => zoom(1.2)); $('#zoomOut').addEventListener('click', () => zoom(1/1.2)); $('#fitBtn').addEventListener('click', fitView);
 $('#deleteBtn').addEventListener('click', deleteSelected); $('#previewBtn').addEventListener('click', preview); $('#downloadBtn').addEventListener('click', download); $('#saveLocalBtn').addEventListener('click', saveLocal);
 $('#projectNameInput').value = topology.projectName;

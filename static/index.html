@@ -1,15 +1,20 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-type="software">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="使用 Docker 构建和配置网络实验拓扑。">
+  <meta name="page-type" content="software">
+  <meta name="site-kind" content="software">
+  <meta name="theme-color" content="#151715">
   <title>拓扑工坊 · Docker 网络实验室</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+  <a class="skip-link" href="#viewport">跳至拓扑画布</a>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><div class="brand-mark">⬡</div><div><strong>拓扑工坊</strong><span>DOCKER NETWORK LAB</span></div></div>
+      <div class="brand"><div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></div><div><strong>拓扑工坊</strong><span>NETWORK LAB</span></div></div>
       <div class="sidebar-section">
         <div class="section-heading">组件库 <span>拖入画布或点击添加</span></div>
         <button class="palette-item" data-add="client" draggable="true"><span class="palette-icon client">⌘</span><span><strong>客户端</strong><small>Client · 测试终端</small></span><span class="palette-plus">＋</span></button>
@@ -29,21 +34,21 @@
 
     <main class="main">
       <header class="topbar">
-        <div class="heading"><span class="eyebrow">WORKSPACE / NETWORK TOPOLOGY</span><h1>网络拓扑设计器</h1><p>画出网络结构，生成可运行的 Docker Compose 项目。</p></div>
+        <div class="heading"><span class="eyebrow">NETWORK LAB / WORKSPACE</span><h1>网络拓扑设计器</h1><p>设计网络结构，生成 Docker Compose 实验项目。</p></div>
         <div class="top-actions"><button class="quiet-button" id="sampleBtn">加载示例</button><button class="quiet-button" id="clearBtn">清空画布</button><button class="quiet-button" id="openTopologyBtn">打开拓扑</button><button class="secondary-button" id="saveTopologyBtn">保存拓扑</button><button class="secondary-button" id="saveLocalBtn" disabled>▣ 选择文件夹并自动保存</button><button class="primary-button" id="downloadBtn"><span>↓</span> 下载项目 ZIP</button></div>
       </header>
 
       <div class="workspace">
         <section class="canvas-panel">
           <div class="canvas-toolbar"><div class="canvas-label"><span class="live-dot"></span> 拓扑画布 <span class="canvas-count" id="counts"></span></div><div class="canvas-tools"><button id="connectBtn" title="连接节点">◇ <span>连接节点</span></button><span class="tool-separator"></span><button id="zoomOut" title="缩小" aria-label="缩小画布">−</button><span id="zoomLabel">100%</span><button id="zoomIn" title="放大" aria-label="放大画布">＋</button><button id="fitBtn" title="居中" aria-label="居中显示拓扑">⊙</button></div></div>
-          <div class="canvas-viewport" id="viewport"><div class="canvas-world" id="world"><svg class="edge-layer" id="edges" width="2400" height="1600" viewBox="0 0 2400 1600"></svg><div class="node-layer" id="nodes"></div></div><div class="canvas-hint" id="canvasHint">拖动节点布局 · 点击节点侧边的连接点创建连线</div></div>
+          <div class="canvas-viewport" id="viewport" tabindex="-1"><div class="canvas-world" id="world"><svg class="edge-layer" id="edges" width="2400" height="1600" viewBox="0 0 2400 1600"></svg><div class="node-layer" id="nodes"></div></div><div class="canvas-hint" id="canvasHint">拖动节点布局 · 点击节点侧边的连接点创建连线</div></div>
           <div class="canvas-footer"><span><i class="legend-dot client"></i>客户端</span><span><i class="legend-dot router"></i>路由器</span><span><i class="legend-dot server"></i>服务器</span><span><i class="legend-dot switch"></i>交换机</span><span class="footer-right">交换机下的设备共享二层网络，可使用不同 IP 网段</span></div>
         </section>
 
         <aside class="inspector"><div class="inspector-title"><span>属性面板</span><button id="deleteBtn" class="icon-button danger" title="删除所选元素" aria-label="删除所选元素" disabled>⌫</button></div><div id="inspectorBody"></div></aside>
       </div>
 
-      <section class="output-panel"><div class="output-header"><div><span class="eyebrow">GENERATED OUTPUT</span><h2>生成预览</h2><p>拓扑变化后点击刷新预览，检查即将下载的文件。</p></div><button class="secondary-button" id="previewBtn">↻ 刷新预览</button></div><div class="local-controls"><label class="project-field">Compose 项目名<input id="projectNameInput" maxlength="63" spellcheck="false" autocomplete="off" aria-label="Compose 项目名"></label><label class="auto-compose"><input type="checkbox" id="autoComposeInput"> 修改后自动 build 并启动</label><span id="localStatus" role="status">尚未关联本地文件夹</span><button id="disconnectLocalBtn" class="quiet-button" hidden>停止同步</button></div><div class="compose-progress" id="composeProgress" hidden><div class="compose-progress-heading"><strong id="composeProgressTitle">准备构建</strong><span id="composeProgressPercent">0%</span></div><progress id="composeProgressBar" max="100" value="0" aria-label="构建启动进度"></progress><div class="compose-progress-message" id="composeProgressMessage">正在准备…</div><details><summary>查看构建记录</summary><pre id="composeProgressLog"></pre></details></div><div class="output-content"><div class="file-list" id="fileList"><div class="empty-file">尚未生成文件</div></div><div class="code-pane"><div class="code-title"><span id="fileTitle">选择文件查看内容</span><button id="copyBtn" title="复制内容" disabled>复制</button></div><pre id="codeContent">添加节点与连线后，点击“刷新预览”。</pre></div></div><div class="warning-list" id="warnings"></div></section>
+      <section class="output-panel"><div class="output-header"><div><span class="eyebrow">PROJECT / OUTPUT</span><h2>生成预览</h2><p>拓扑变化后点击刷新预览，检查即将下载的文件。</p></div><button class="secondary-button" id="previewBtn">↻ 刷新预览</button></div><div class="local-controls"><label class="project-field">Compose 项目名<input id="projectNameInput" maxlength="63" spellcheck="false" autocomplete="off" aria-label="Compose 项目名"></label><label class="auto-compose"><input type="checkbox" id="autoComposeInput"> 修改后自动 build 并启动</label><span id="localStatus" role="status">尚未关联本地文件夹</span><button id="disconnectLocalBtn" class="quiet-button" hidden>停止同步</button></div><div class="compose-progress" id="composeProgress" hidden><div class="compose-progress-heading"><strong id="composeProgressTitle">准备构建</strong><span id="composeProgressPercent">0%</span></div><progress id="composeProgressBar" max="100" value="0" aria-label="构建启动进度"></progress><div class="compose-progress-message" id="composeProgressMessage">正在准备…</div><details><summary>查看构建记录</summary><pre id="composeProgressLog"></pre></details></div><div class="output-content"><div class="file-list" id="fileList"><div class="empty-file">尚未生成文件</div></div><div class="code-pane"><div class="code-title"><span id="fileTitle">选择文件查看内容</span><button id="copyBtn" title="复制内容" disabled>复制</button></div><pre id="codeContent">添加节点与连线后，点击“刷新预览”。</pre></div></div><div class="warning-list" id="warnings"></div></section>
     </main>
   </div>
   <input type="file" id="topologyFileInput" accept="application/json,.json" hidden>

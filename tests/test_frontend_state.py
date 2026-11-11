@@ -6,6 +6,12 @@ from pathlib import Path
 
 
 class FrontendStateTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required to test keyboard interaction')
+    def test_keyboard_selection_connection_and_cancellation(self):
+        root = Path(__file__).resolve().parents[1]
+        subprocess.run(['node', str(root / 'tests' / 'frontend_keyboard.js'),
+                        str(root / 'static' / 'app.js')], check=True, capture_output=True, text=True)
+
     @unittest.skipUnless(shutil.which('node'), 'Node.js is required to test browser state restoration')
     def test_saved_topology_restores_server_choices(self):
         saved = {
